@@ -21,6 +21,8 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeRow}
 import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
 import org.apache.spark.sql.execution.datasources.v2.state.utils.SchemaUtil
+import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorsUtils, StatePartitionKeyExtractorFactory}
+import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper.{LeftSide, RightSide}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.SymmetricHashJoinStateManager
 import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.{StateStoreColumnFamilySchemaUtils, StateVariableType, TransformWithStateVariableInfo}
 import org.apache.spark.sql.execution.streaming.state._
@@ -38,7 +40,21 @@ import org.apache.spark.util.{NextIterator, SerializableConfiguration}
  */
 case class AllColumnFamiliesReaderInfo(
     colFamilySchemas: Set[StateStoreColFamilySchema] = Set.empty,
-    stateVariableInfos: List[TransformWithStateVariableInfo] = List.empty)
+    stateVariableInfos: List[TransformWithStateVariableInfo] = List.empty,
+    operatorName: String,
+    stateFormatVersion: Option[Int] = None)
+
+private[state] object StatePartitionReaderUtils {
+  val v4JoinCFNames: Set[String] =
+    SymmetricHashJoinStateManager.allStateStoreNamesV4(LeftSide, RightSide).toSet
+
+  def isMultiValuedCF(
+      colFamilyNameOpt: Option[String],
+      stateVariableInfoOpt: Option[TransformWithStateVariableInfo]): Boolean = {
+    SchemaUtil.checkVariableType(stateVariableInfoOpt, StateVariableType.ListState) ||
+      colFamilyNameOpt.exists(v4JoinCFNames.contains)
+  }
+}
 
 /**
  * An implementation of [[PartitionReaderFactory]] for State data source. This is used to support
@@ -81,6 +97,11 @@ class StatePartitionReaderFactory(
 /**
  * An implementation of [[PartitionReader]] for State data source. This is used to support
  * general read from a state store instance, rather than specific to the operator.
+ *
+ * NOTE: The state data source is strictly read-only. Any new reader added here must open the
+ * state store in read-only mode (via [[StateStoreProvider.getReadStore]] or
+ * [[SupportsFineGrainedReplay.replayReadStateFromSnapshot]]) so the read path never writes to
+ * the checkpoint and does not require write access to it.
  */
 abstract class StatePartitionReaderBase(
     storeConf: StateStoreConf,
@@ -142,8 +163,8 @@ abstract class StatePartitionReaderBase(
 
     val useColFamilies = stateVariableInfoOpt.isDefined || joinColFamilyOpt.isDefined
 
-    val useMultipleValuesPerKey = SchemaUtil.checkVariableType(stateVariableInfoOpt,
-      StateVariableType.ListState)
+    val useMultipleValuesPerKey = StatePartitionReaderUtils.isMultiValuedCF(
+      joinColFamilyOpt, stateVariableInfoOpt)
 
     val provider = StateStoreProvider.createAndInit(
       stateStoreProviderId, keySchema, valueSchema, keyStateEncoderSpec,
@@ -151,7 +172,9 @@ abstract class StatePartitionReaderBase(
       useMultipleValuesPerKey = useMultipleValuesPerKey, stateSchemaProviderOpt)
 
     if (useColFamilies) {
-      val store = provider.getStore(
+      // Register the column family on a read-only store so the read path does not write
+      // to the checkpoint (column-family registration is an in-memory operation).
+      val readStore = provider.getReadStore(
         partition.sourceOptions.batchId + 1,
         getEndStoreUniqueId)
       require(stateStoreColFamilySchemaOpt.isDefined)
@@ -160,14 +183,14 @@ abstract class StatePartitionReaderBase(
         StateStoreColumnFamilySchemaUtils.isTestingInternalColFamily(
           stateStoreColFamilySchema.colFamilyName)
       require(stateStoreColFamilySchema.keyStateEncoderSpec.isDefined)
-      store.createColFamilyIfAbsent(
+      readStore.registerColFamily(
         stateStoreColFamilySchema.colFamilyName,
         stateStoreColFamilySchema.keySchema,
         stateStoreColFamilySchema.valueSchema,
         stateStoreColFamilySchema.keyStateEncoderSpec.get,
         useMultipleValuesPerKey = useMultipleValuesPerKey,
         isInternal = isInternal)
-      store.abort()
+      readStore.release()
     }
     provider
   }
@@ -246,6 +269,12 @@ class StatePartitionReader(
       val stateVarType = stateVariableInfo.stateVariableType
       SchemaUtil.processStateEntries(stateVarType, colFamilyName, store,
         keySchema, partition.partition, partition.sourceOptions)
+    } else if (joinColFamilyOpt.exists(StatePartitionReaderUtils.v4JoinCFNames.contains)) {
+      store
+        .iteratorWithMultiValues(colFamilyName)
+        .map { pair =>
+          SchemaUtil.unifyStateRowPair((pair.key, pair.value), partition.partition)
+        }
     } else {
       store
         .iterator(colFamilyName)
@@ -285,18 +314,55 @@ class StatePartitionAllColumnFamiliesReader(
 
   private val stateStoreColFamilySchemas = allColumnFamiliesReaderInfo.colFamilySchemas
   private val stateVariableInfos = allColumnFamiliesReaderInfo.stateVariableInfos
+  private val operatorName = allColumnFamiliesReaderInfo.operatorName
+  private val stateFormatVersion = allColumnFamiliesReaderInfo.stateFormatVersion
 
-  private def isListType(colFamilyName: String): Boolean = {
-    SchemaUtil.checkVariableType(
-      stateVariableInfos.find(info => info.stateName == colFamilyName),
-      StateVariableType.ListState)
+  private def isTWSOperator(operatorName: String): Boolean = {
+    StatefulOperatorsUtils.TRANSFORM_WITH_STATE_OP_NAMES.contains(operatorName)
+  }
+
+  private def isDefaultColFamilyInTWS(operatorName: String, colFamilyName: String): Boolean = {
+    isTWSOperator(operatorName) && colFamilyName == StateStore.DEFAULT_COL_FAMILY_NAME
+  }
+
+  // Using the heuristic that all operators that enable column families
+  // have a non-default column family
+  private lazy val useColumnFamilies: Boolean = {
+    stateStoreColFamilySchemas.exists(_.colFamilyName != StateStore.DEFAULT_COL_FAMILY_NAME)
+  }
+
+  // Create extractors for each column family - each column family may have different key schema
+  private lazy val cfPartitionKeyExtractors: Map[String, StatePartitionKeyExtractor] = {
+
+    stateStoreColFamilySchemas
+      // Filter out default column family for TWS operators because they are not in use
+      // and will not have a key extractor
+      .filter(schema => !isDefaultColFamilyInTWS(operatorName, schema.colFamilyName))
+      .map { cfSchema =>
+        val stateVariableInfoOpt = stateVariableInfos.find(
+          _.stateName == StateStoreColumnFamilySchemaUtils.getBaseStateName(
+            cfSchema.colFamilyName))
+        val extractor = StatePartitionKeyExtractorFactory.create(
+          operatorName,
+          cfSchema.keySchema,
+          partition.sourceOptions.storeName,
+          cfSchema.colFamilyName,
+          stateFormatVersion,
+          stateVariableInfoOpt)
+        cfSchema.colFamilyName -> extractor
+      }.toMap
+  }
+
+  private def isMultiValuedCF(colFamilyName: String): Boolean = {
+    StatePartitionReaderUtils.isMultiValuedCF(
+      Some(colFamilyName),
+      stateVariableInfos.find(info => info.stateName == colFamilyName))
   }
 
   override protected lazy val provider: StateStoreProvider = {
     val stateStoreId = StateStoreId(partition.sourceOptions.stateCheckpointLocation.toString,
       partition.sourceOptions.operatorId, partition.partition, partition.sourceOptions.storeName)
     val stateStoreProviderId = StateStoreProviderId(stateStoreId, partition.queryId)
-    val useColumnFamilies = stateStoreColFamilySchemas.size > 1
     StateStoreProvider.createAndInit(
       stateStoreProviderId, keySchema, valueSchema, keyStateEncoderSpec,
       useColumnFamilies, storeConf, hadoopConf.value,
@@ -305,7 +371,7 @@ class StatePartitionAllColumnFamiliesReader(
 
   private def checkAllColFamiliesExist(
       colFamilyNames: List[String],
-      stateStore: StateStore
+      stateStore: ReadStateStore
     ): Unit = {
     // Filter out DEFAULT column family from validation for two reasons:
     // 1. Some operators (e.g., stream-stream join v3) don't include DEFAULT in their schema
@@ -326,19 +392,17 @@ class StatePartitionAllColumnFamiliesReader(
         s"Column families in state store but not in metadata: ${expectedCFs.diff(actualCFs)}")
   }
 
-  // Use a single store instance for both registering column families and iteration.
-  // We cannot abort and then get a read store because abort() invalidates the loaded version,
-  // causing getReadStore() to reload from checkpoint and clear the column family registrations.
-  private lazy val store: StateStore = {
+  // Use a single read-mode store instance for both registering column families and iteration.
+  private lazy val store: ReadStateStore = {
     assert(getStartStoreUniqueId == getEndStoreUniqueId,
       "Start and end store unique IDs must be the same when reading all column families")
-    val stateStore = provider.getStore(
+    val stateStore = provider.getReadStore(
       partition.sourceOptions.batchId + 1,
       getStartStoreUniqueId
     )
 
     // Register all column families from the schema
-    if (stateStoreColFamilySchemas.size > 1) {
+    if (useColumnFamilies) {
       checkAllColFamiliesExist(stateStoreColFamilySchemas.map(_.colFamilyName).toList, stateStore)
       stateStoreColFamilySchemas.foreach { cfSchema =>
         cfSchema.colFamilyName match {
@@ -346,10 +410,10 @@ class StatePartitionAllColumnFamiliesReader(
           case _ =>
             val isInternal =
               StateStoreColumnFamilySchemaUtils.isInternalColFamily(cfSchema.colFamilyName)
-            val useMultipleValuesPerKey = isListType(cfSchema.colFamilyName)
+            val useMultipleValuesPerKey = isMultiValuedCF(cfSchema.colFamilyName)
             require(cfSchema.keyStateEncoderSpec.isDefined,
               s"keyStateEncoderSpec must be defined for column family ${cfSchema.colFamilyName}")
-            stateStore.createColFamilyIfAbsent(
+            stateStore.registerColFamily(
               cfSchema.colFamilyName,
               cfSchema.keySchema,
               cfSchema.valueSchema,
@@ -364,26 +428,28 @@ class StatePartitionAllColumnFamiliesReader(
 
   override lazy val iter: Iterator[InternalRow] = {
     // Iterate all column families and concatenate results
-    stateStoreColFamilySchemas.iterator.flatMap { cfSchema =>
-      if (isListType(cfSchema.colFamilyName)) {
-        store.iterator(cfSchema.colFamilyName).flatMap(
-          pair =>
-            store.valuesIterator(pair.key, cfSchema.colFamilyName).map {
-              value =>
-                SchemaUtil.unifyStateRowPairAsRawBytes((pair.key, value), cfSchema.colFamilyName)
-            }
-        )
-      } else {
-        store.iterator(cfSchema.colFamilyName).map { pair =>
-          SchemaUtil.unifyStateRowPairAsRawBytes(
-            (pair.key, pair.value), cfSchema.colFamilyName)
+    stateStoreColFamilySchemas.iterator
+      // Filter out default column family for TWS operators because they are not in use
+      // and will not have data
+      .filter(schema => !isDefaultColFamilyInTWS(operatorName, schema.colFamilyName))
+      .flatMap { cfSchema =>
+        val extractor = cfPartitionKeyExtractors(cfSchema.colFamilyName)
+        if (isMultiValuedCF(cfSchema.colFamilyName)) {
+          store.iteratorWithMultiValues(cfSchema.colFamilyName).map { pair =>
+            SchemaUtil.unifyStateRowPairAsRawBytes(
+              (pair.key, pair.value), cfSchema.colFamilyName, extractor)
+          }
+        } else {
+          store.iterator(cfSchema.colFamilyName).map { pair =>
+            SchemaUtil.unifyStateRowPairAsRawBytes(
+              (pair.key, pair.value), cfSchema.colFamilyName, extractor)
+          }
         }
-      }
     }
   }
 
   override def close(): Unit = {
-    store.abort()
+    store.release()
     super.close()
   }
 }

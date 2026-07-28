@@ -19,7 +19,7 @@ package org.apache.spark.sql.pipelines.graph
 
 import org.scalatest.time.{Seconds, Span}
 
-import org.apache.spark.sql.{functions, Row, SparkSession}
+import org.apache.spark.sql.{functions, Row}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.classic.{DataFrame, Dataset}
 import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Identifier, TableCatalog}
@@ -183,7 +183,6 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
 
     // Construct pipeline
     val pipelineDef = new TestGraphRegistrationContext(spark) {
-      implicit val sparkSession: SparkSession = spark
       private val ints = MemoryStream[Int]
       ints.addData(1 until 10: _*)
       registerView("input", query = dfFlowFunc(ints.toDF()))
@@ -260,7 +259,6 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
 
     // Construct pipeline
     val pipelineDef = new TestGraphRegistrationContext(spark) {
-      implicit val sparkSession: SparkSession = spark
       private val ints = MemoryStream[Int]
       registerView("input", query = dfFlowFunc(ints.toDF()))
       registerTable(
@@ -311,7 +309,6 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     })
 
     val pipelineDef = new TestGraphRegistrationContext(spark) {
-      implicit val sparkSession: SparkSession = spark
       private val memoryStream = MemoryStream[Int]
       memoryStream.addData(1, 2)
       registerView("input_view", query = dfFlowFunc(memoryStream.toDF()))
@@ -551,7 +548,6 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
 
     // Construct pipeline
     val pipelineDef = new TestGraphRegistrationContext(spark) {
-      implicit val sparkSession: SparkSession = spark
       private val memoryStream = MemoryStream[Int]
       memoryStream.addData(1, 2)
       registerView("input_view", query = dfFlowFunc(memoryStream.toDF()))
@@ -1063,5 +1059,54 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     val errorCount = failedEvents.count(_.level == EventLevel.ERROR)
 
     assert(warnCount == 2 && errorCount == 1)
+  }
+
+  /** A non-retryable (retries exhausted) failure, i.e. one that stops the run. */
+  private def stopFailure(ts: Long, flowName: String, cause: Throwable): TriggeredFailureInfo = {
+    // currentNumTries > maxAllowedRetries yields a StopFlowExecution.
+    val action = GraphExecution.determineFlowExecutionActionFromError(
+      ex = cause,
+      flowDisplayName = flowName,
+      currentNumTries = 2,
+      maxAllowedRetries = 1)
+    TriggeredFailureInfo(ts, numFailures = 2, lastException = cause, lastExceptionAction = action)
+  }
+
+  test("chooseRunTerminationReason surfaces the earliest non-retryable failure deterministically") {
+    val earliestCause = new RuntimeException("earliest")
+    // A retryable failure with an earlier timestamp must be ignored: it does not stop the run.
+    val retryable = {
+      val cause = new RuntimeException("retryable")
+      val action = GraphExecution.determineFlowExecutionActionFromError(
+        ex = cause, flowDisplayName = "flow_retry", currentNumTries = 1, maxAllowedRetries = 3)
+      TableIdentifier("flow_retry") -> TriggeredFailureInfo(
+        50, numFailures = 1, lastException = cause, lastExceptionAction = action)
+    }
+    val entries = Seq(
+      TableIdentifier("flow_c") -> stopFailure(300, "flow_c", new RuntimeException("c")),
+      TableIdentifier("flow_b") -> stopFailure(100, "flow_b", earliestCause),
+      TableIdentifier("flow_a") -> stopFailure(200, "flow_a", new RuntimeException("a")),
+      retryable)
+
+    // The earliest non-retryable failure (flow_b @ 100) wins regardless of iteration order.
+    Seq(entries, entries.reverse).foreach { ordered =>
+      assert(
+        TriggeredGraphExecution.chooseRunTerminationReason(ordered.iterator)
+          .contains(QueryExecutionFailure("flow_b", 1, Some(earliestCause))))
+    }
+  }
+
+  test("chooseRunTerminationReason breaks ties between equal timestamps by flow name") {
+    val aCause = new RuntimeException("a")
+    val entries = Seq(
+      TableIdentifier("flow_z") -> stopFailure(100, "flow_z", new RuntimeException("z")),
+      TableIdentifier("flow_a") -> stopFailure(100, "flow_a", aCause))
+    assert(
+      TriggeredGraphExecution.chooseRunTerminationReason(entries.iterator)
+        .contains(QueryExecutionFailure("flow_a", 1, Some(aCause))))
+  }
+
+  test("chooseRunTerminationReason has no reason when no flow stopped the run") {
+    assert(TriggeredGraphExecution.chooseRunTerminationReason(Iterator.empty).isEmpty)
   }
 }

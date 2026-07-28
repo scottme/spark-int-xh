@@ -482,6 +482,19 @@ The following configurations are optional:
   <td>milliseconds to wait before retrying to fetch Kafka offsets</td>
 </tr>
 <tr>
+  <td>partition.metadata.cache.ttl.ms</td>
+  <td>long</td>
+  <td>-1</td>
+  <td>streaming and batch</td>
+  <td>How long (in milliseconds) to cache the set of assigned Kafka topic-partitions in the driver
+  before issuing a fresh <code>DescribeTopics</code> RPC to the broker. When set to a positive value,
+  repeated offset fetches within the TTL window reuse the cached partition set instead of querying
+  the broker each time, reducing metadata load on the broker and on the driver. This mirrors
+  the semantics of the Kafka client's own <code>metadata.max.age.ms</code> setting. Set to -1
+  (the default) to disable caching (existing behavior). Note: newly added partitions will not be
+  discovered until the cache expires.</td>
+</tr>
+<tr>
   <td>maxOffsetsPerTrigger</td>
   <td>long</td>
   <td>none</td>
@@ -586,6 +599,46 @@ For more details on <code>KafkaConsumer.offsetsForTimes</code>, please refer <a 
 Also, the meaning of <code>timestamp</code> here can be vary according to Kafka configuration (<code>log.message.timestamp.type</code>): please refer <a href="https://kafka.apache.org/documentation/">Kafka documentation</a> for further details.
 
 Timestamp offset options require Kafka 0.10.1.0 or higher.
+
+#### Timestamp offset behavior illustrated
+
+The following diagrams illustrate how Kafka resolves offsets when querying by timestamp for any particular topic partition. Each diagram shows a timeline with records (r1, r2, r3, ...) and the provided timestamp (ts), which can be global or per partition. The returned offset points to the **first record whose timestamp is greater than or equal to the provided timestamp**.
+
+**Scenario 1: Timestamp is before existing records**
+
+```
+Timeline:  ───────|────────|───|───|───|───|──▶
+                  ts       r1  r2  r3  r4  r5
+                           ↑
+                        returned
+
+Result: r1 is returned (first record with timestamp >= ts)
+```
+
+**Scenario 2: Timestamp is after all existing records**
+
+```
+Timeline:  ──|───|───|───|───|─────────────|──▶
+             r1  r2  r3  r4  r5            ts
+                                           ↑
+                                     no match found
+
+Result: No offset returned by Kafka; behavior falls back to
+        startingOffsetsByTimestampStrategy ("error" or "latest")
+```
+
+**Scenario 3: Timestamp falls between records**
+
+```
+Timeline:  ─────|─────────|──────|──────────|──▶
+                r1        ts     r2         r3
+                                 ↑
+                              returned
+
+Result: r2 is returned (first record with timestamp >= ts)
+```
+
+**Note:** For starting offsets, ingestion begins from the returned offset (inclusive), or follows <code>startingOffsetsByTimestampStrategy</code> in scenario 2. For ending offsets, ingestion stops at the returned offset (exclusive), or falls back to latest in scenario 2.
 
 ### Offset fetching
 

@@ -22,7 +22,7 @@ import java.util.Collections
 import org.scalatest.BeforeAndAfter
 
 import org.apache.spark.{SPARK_DOC_ROOT, SparkException, SparkNumberFormatException}
-import org.apache.spark.sql.{AnalysisException, QueryTest, Row}
+import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLId
 import org.apache.spark.sql.connector.catalog.{BasicInMemoryTableCatalog, DefaultValue, Identifier, InMemoryCatalog}
@@ -38,7 +38,7 @@ import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{DataType, DataTypes, IntegerType, StructField, StructType}
 import org.apache.spark.unsafe.types.UTF8String
 
-class ProcedureSuite extends QueryTest with SharedSparkSession with BeforeAndAfter {
+class ProcedureSuite extends SharedSparkSession with BeforeAndAfter {
 
   before {
     spark.conf.set(s"spark.sql.catalog.cat", classOf[InMemoryCatalog].getName)
@@ -219,6 +219,18 @@ class ProcedureSuite extends QueryTest with SharedSparkSession with BeforeAndAft
       sql("USE ns")
       val df = sql("CALL sum(1, 2)")
       checkAnswer(df, Row(3) :: Nil)
+    }
+  }
+
+  test("PATH enabled: unqualified CALL skips missing candidate and keeps searching") {
+    withSQLConf(SQLConf.PATH_ENABLED.key -> "true") {
+      try {
+        catalog("cat2").createProcedure(Identifier.of(Array("ns_hit"), "sum"), UnboundLongSum)
+        sql("SET PATH = cat.ns_miss, cat2.ns_hit")
+        checkAnswer(sql("CALL sum(1, 2)"), Row(3L) :: Nil)
+      } finally {
+        sql("SET PATH = DEFAULT_PATH")
+      }
     }
   }
 
@@ -493,7 +505,7 @@ class ProcedureSuite extends QueryTest with SharedSparkSession with BeforeAndAft
   }
 
   test("SPARK-51780: Implement DESC PROCEDURE") {
-    catalog.createProcedure(Identifier.of(Array("ns"), "foo"), UnboundSum)
+    catalog.createProcedure(Identifier.of(Array("ns"), "foo"), SimpleSum)
     catalog.createProcedure(Identifier.of(Array("ns", "db"), "abc"), UnboundLongSum)
     catalog.createProcedure(Identifier.of(Array(""), "xyz"), UnboundComplexProcedure)
     catalog.createProcedure(Identifier.of(Array(), "xxx"), UnboundStructProcedure)
@@ -517,20 +529,26 @@ class ProcedureSuite extends QueryTest with SharedSparkSession with BeforeAndAft
 
       checkAnswer(
         sql("DESC PROCEDURE cat.ns.foo"),
-        Row("Procedure:   sum") ::
-          Row("Description: sum integers") :: Nil)
+        Row("Procedure:   simple_sum") ::
+          Row("Description: simple sum integers") ::
+          Row("Parameters:  IN in1 INT") ::
+          Row("             IN in2 INT") :: Nil)
 
       checkAnswer(
         // use DESCRIBE instead of DESC
         sql("DESCRIBE PROCEDURE cat.ns.foo"),
-        Row("Procedure:   sum") ::
-          Row("Description: sum integers") :: Nil)
+        Row("Procedure:   simple_sum") ::
+          Row("Description: simple sum integers") ::
+          Row("Parameters:  IN in1 INT") ::
+          Row("             IN in2 INT") :: Nil)
 
       checkAnswer(
         // use default catalog
         sql("DESC PROCEDURE ns.foo"),
-        Row("Procedure:   sum") ::
-          Row("Description: sum integers") :: Nil)
+        Row("Procedure:   simple_sum") ::
+          Row("Description: simple sum integers") ::
+          Row("Parameters:  IN in1 INT") ::
+          Row("             IN in2 INT") :: Nil)
 
       checkAnswer(
         // use multi-part namespace
@@ -559,6 +577,45 @@ class ProcedureSuite extends QueryTest with SharedSparkSession with BeforeAndAft
         sql("DESC PROCEDURE cat2.ns_1.db_1.foo"),
         Row("Procedure:   void") ::
           Row("Description: void procedure") :: Nil)
+    }
+  }
+
+  test("SPARK-51780: DESC PROCEDURE with binding failure") {
+    catalog.createProcedure(Identifier.of(Array("ns"), "bind_fail"), UnboundBindFailProcedure)
+    checkAnswer(
+      sql("DESC PROCEDURE cat.ns.bind_fail"),
+      Row("Procedure:   bind_fail") ::
+      Row("Description: bind fail procedure") :: Nil)
+  }
+
+  test("SPARK-51780: DESC PROCEDURE with zero parameters") {
+    catalog.createProcedure(
+      Identifier.of(Array("ns"), "zero_params"), SimpleZeroParameterProcedure)
+    checkAnswer(
+      sql("DESC PROCEDURE cat.ns.zero_params"),
+      Row("Procedure:   zero_params") ::
+      Row("Description: zero parameter procedure") ::
+      Row("Parameters:  ()") :: Nil)
+  }
+
+  test("SPARK-55982: DROP NAMESPACE CASCADE removes procedures") {
+    sql("CREATE NAMESPACE cat.dropns")
+    catalog.createProcedure(Identifier.of(Array("dropns"), "sum"), UnboundSum)
+    // Procedure resolves before drop.
+    checkAnswer(sql("CALL cat.dropns.sum(1, 2)"), Row(3) :: Nil)
+    sql("DROP NAMESPACE cat.dropns CASCADE")
+    // After cascade drop, the procedure must no longer resolve.
+    checkError(
+      exception = intercept[AnalysisException](sql("CALL cat.dropns.sum(1, 2)")),
+      condition = "FAILED_TO_LOAD_ROUTINE",
+      parameters = Map("routineName" -> "`cat`.`dropns`.`sum`"))
+  }
+
+  object UnboundBindFailProcedure extends UnboundProcedure {
+    override def name: String = "bind_fail"
+    override def description: String = "bind fail procedure"
+    override def bind(inputType: StructType): BoundProcedure = {
+      throw new UnsupportedOperationException("Cannot bind")
     }
   }
 
@@ -908,5 +965,13 @@ class ProcedureSuite extends QueryTest with SharedSparkSession with BeforeAndAft
     override def name: String = "simple_sum"
 
     override def description: String = "simple sum integers"
+  }
+
+  object SimpleZeroParameterProcedure extends SimpleProcedure {
+    override def name: String = "zero_params"
+    override def description: String = "zero parameter procedure"
+    override def isDeterministic: Boolean = true
+    override def parameters: Array[ProcedureParameter] = Array.empty
+    override def call(input: InternalRow): java.util.Iterator[Scan] = Collections.emptyIterator
   }
 }

@@ -244,12 +244,11 @@ class SparkContextSuite extends SparkFunSuite with LocalSparkContext with Eventu
   }
 
   test("add and list jar files") {
-    val testJar = Thread.currentThread().getContextClassLoader.getResource("TestUDTF.jar")
-    assume(testJar != null)
+    val testJar = TestUtils.createJarWithClasses(Seq("SparkContextSuite_AddJar"))
     try {
       sc = new SparkContext(new SparkConf().setAppName("test").setMaster("local"))
       sc.addJar(testJar.toString)
-      assert(sc.listJars().count(_.contains("TestUDTF.jar")) == 1)
+      assert(sc.listJars().count(_.contains("testJar")) == 1)
     } finally {
       sc.stop()
     }
@@ -257,10 +256,10 @@ class SparkContextSuite extends SparkFunSuite with LocalSparkContext with Eventu
 
   test("add FS jar files not exists") {
     try {
-      val jarPath = "hdfs:///no/path/to/TestUDTF.jar"
+      val jarPath = "hdfs:///no/path/to/nonexistent.jar"
       sc = new SparkContext(new SparkConf().setAppName("test").setMaster("local"))
       sc.addJar(jarPath)
-      assert(sc.listJars().forall(!_.contains("TestUDTF.jar")))
+      assert(sc.listJars().forall(!_.contains("nonexistent.jar")))
     } finally {
       sc.stop()
     }
@@ -402,8 +401,7 @@ class SparkContextSuite extends SparkFunSuite with LocalSparkContext with Eventu
       case "non-local-mode" => "local-cluster[1,1,1024]"
     }
     test(s"$method can be called twice with same file in $schedulingMode (SPARK-16787)") {
-      val testJar = Thread.currentThread().getContextClassLoader.getResource("TestUDTF.jar")
-      assume(testJar != null)
+      val testJar = TestUtils.createJarWithClasses(Seq("SparkContextSuite_SPARK16787"))
       sc = new SparkContext(master, "test")
       val jarPath = testJar.toString
       method match {
@@ -849,7 +847,7 @@ class SparkContextSuite extends SparkFunSuite with LocalSparkContext with Eventu
     val listener = new SparkListener {
       override def onExecutorMetricsUpdate(
           executorMetricsUpdate: SparkListenerExecutorMetricsUpdate): Unit = {
-        if (executorMetricsUpdate.execId != SparkContext.DRIVER_IDENTIFIER) {
+        if (!SparkContext.isDriver(executorMetricsUpdate.execId)) {
           runningTaskIds = executorMetricsUpdate.accumUpdates.map(_._1)
         }
       }
@@ -893,7 +891,7 @@ class SparkContextSuite extends SparkFunSuite with LocalSparkContext with Eventu
       ("yarn", 2, Option(1))
     ).foreach { case (master, cpusPerTask, executorCores) =>
       val conf = new SparkConf()
-      conf.set(CPUS_PER_TASK, cpusPerTask)
+      conf.set(CPUS_PER_TASK, BigDecimal(cpusPerTask))
       executorCores.map(executorCores => conf.set(EXECUTOR_CORES, executorCores))
       val ex = intercept[SparkException] {
         sc = new SparkContext(master, "test", conf)
@@ -1010,7 +1008,7 @@ class SparkContextSuite extends SparkFunSuite with LocalSparkContext with Eventu
       val conf = new SparkConf()
         .setMaster("local-cluster[3, 2, 1024]")
         .setAppName("test-cluster")
-        .set(CPUS_PER_TASK, 2)
+        .set(CPUS_PER_TASK, BigDecimal(2))
         .set(WORKER_GPU_ID.amountConf, "3")
         .set(WORKER_GPU_ID.discoveryScriptConf, discoveryScript)
         .set(TASK_GPU_ID.amountConf, "3")
@@ -1023,7 +1021,7 @@ class SparkContextSuite extends SparkFunSuite with LocalSparkContext with Eventu
 
       val rdd1 = sc.makeRDD(1 to 10, 3).mapPartitions { it =>
         val context = TaskContext.get()
-        Iterator(context.cpus())
+        Iterator(context.cpuAmount())
       }
       val cpus = rdd1.collect()
       assert(cpus === Array(2, 2, 2))
@@ -1474,6 +1472,54 @@ class SparkContextSuite extends SparkFunSuite with LocalSparkContext with Eventu
     assert(!sc.conf.get(SparkLauncher.DRIVER_EXTRA_JAVA_OPTIONS).contains("-Dfoo=bar"))
     assert(!sc.conf.get(SparkLauncher.EXECUTOR_EXTRA_JAVA_OPTIONS).contains("-Dfoo=bar"))
     sc.stop()
+  }
+
+  test("SPARK-55757: Improve `spark.task.cpus` validation") {
+    val conf = new SparkConf().setAppName("test").setMaster("local")
+      .set(CPUS_PER_TASK, BigDecimal(0))
+    val m = intercept[SparkIllegalArgumentException] {
+      sc = new SparkContext(conf)
+    }.getMessage
+    assert(m.contains("Number of cores to allocate for each task must be a positive value"))
+  }
+
+  test("SPARK-58192: spark.task.cpus rejects out-of-range and over-precise values") {
+    def read(value: String): BigDecimal = {
+      new SparkConf().set(CPUS_PER_TASK.key, value).get(CPUS_PER_TASK)
+    }
+    assert(read("1.5") == BigDecimal("1.5"))
+    assert(read("0.000000001") == BigDecimal("1E-9"))
+    assert(read("2147483647") == BigDecimal(Int.MaxValue))
+    // trailing zeros beyond 9 decimal places are stripped before the precision check
+    assert(read("1.5000000000000") == BigDecimal("1.5"))
+    // Includes extreme exponents: they must be rejected by the bounds check before the
+    // normalization step could materialize their huge unscaled representation.
+    Seq("0", "-1", "4e-10", "2147483648", "1e100000000", "1e1000000000").foreach { v =>
+      val e = intercept[SparkIllegalArgumentException] { read(v) }
+      assert(e.getMessage.contains("must be a positive value between"), s"for value $v")
+    }
+    val e = intercept[SparkIllegalArgumentException] { read("0.1234567891") }
+    assert(e.getMessage.contains("supports at most 9 decimal places"))
+  }
+
+  test("SPARK-57867: Driver should not reserve off-heap memory in non-local mode") {
+    val conf = new SparkConf()
+      .setAppName("test")
+      .setMaster("local-cluster[1,1,1024]")
+      .set(MEMORY_OFFHEAP_ENABLED, true)
+      .set(MEMORY_OFFHEAP_SIZE, 5L * 1024 * 1024)
+    sc = new SparkContext(conf)
+    assert(sc.env.memoryManager.maxOffHeapStorageMemory === 0)
+  }
+
+  test("SPARK-57867: Driver should reserve off-heap memory in local mode") {
+    val conf = new SparkConf()
+      .setAppName("test")
+      .setMaster("local")
+      .set(MEMORY_OFFHEAP_ENABLED, true)
+      .set(MEMORY_OFFHEAP_SIZE, 5L * 1024 * 1024)
+    sc = new SparkContext(conf)
+    assert(sc.env.memoryManager.maxOffHeapStorageMemory > 0)
   }
 }
 

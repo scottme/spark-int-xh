@@ -19,6 +19,7 @@ package org.apache.spark.sql.connect.ui
 
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets.UTF_8
+import java.util.Base64
 
 import scala.xml.Node
 
@@ -29,6 +30,17 @@ import org.apache.spark.sql.connect.ui.ToolTips._
 import org.apache.spark.ui._
 import org.apache.spark.ui.UIUtils._
 import org.apache.spark.util.Utils
+
+// userId is part of a session's natural key but is opaque and arbitrary. It is carried through UI
+// links as unpadded base64url, whose alphabet (A-Za-z0-9-_) survives XssSafeRequest sanitization
+// and the PagedTable parameter re-echo unchanged.
+private[spark] object ConnectUiUtils {
+  def encodeUserId(userId: String): String =
+    Base64.getUrlEncoder.withoutPadding.encodeToString(userId.getBytes(UTF_8))
+
+  def decodeUserId(token: String): String =
+    new String(Base64.getUrlDecoder.decode(token), UTF_8)
+}
 
 /** Page for Spark UI that shows statistics for a Spark Connect Server. */
 private[ui] class SparkConnectServerPage(parent: SparkConnectServerTab)
@@ -93,7 +105,7 @@ private[ui] class SparkConnectServerPage(parent: SparkConnectServerTab)
             showSessionLink = true).table(sqlTablePage))
       } catch {
         case e @ (_: IllegalArgumentException | _: IndexOutOfBoundsException) =>
-          Some(<div class="alert alert-error">
+          Some(<div class="alert alert-danger">
             <p>Error while rendering job table:</p>
             <pre>
               {Utils.exceptionString(e)}
@@ -104,15 +116,16 @@ private[ui] class SparkConnectServerPage(parent: SparkConnectServerTab)
       None
     }
     val content =
-      <span id="sqlstat" class="collapse-aggregated-sqlstat collapse-table"
-            onClick="collapseTable('collapse-aggregated-sqlstat',
-                'aggregated-sqlstat')">
+      <span id="sqlstat" class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-sqlstat"
+            aria-expanded="true" aria-controls="aggregated-sqlstat"
+            data-collapse-name="collapse-aggregated-sqlstat">
         <h4>
           <span class="collapse-table-arrow arrow-open"></span>
           <a>Request Statistics ({numStatement})</a>
         </h4>
       </span> ++
-        <div class="aggregated-sqlstat collapsible-table">
+        <div class="collapsible-table collapse show" id="aggregated-sqlstat">
           {table.getOrElse("No statistics have been generated yet.")}
         </div>
     content
@@ -139,7 +152,7 @@ private[ui] class SparkConnectServerPage(parent: SparkConnectServerTab)
             sessionTableTag).table(sessionTablePage))
       } catch {
         case e @ (_: IllegalArgumentException | _: IndexOutOfBoundsException) =>
-          Some(<div class="alert alert-error">
+          Some(<div class="alert alert-danger">
             <p>Error while rendering job table:</p>
             <pre>
               {Utils.exceptionString(e)}
@@ -151,15 +164,16 @@ private[ui] class SparkConnectServerPage(parent: SparkConnectServerTab)
     }
 
     val content =
-      <span id="sessionstat" class="collapse-aggregated-sessionstat collapse-table"
-            onClick="collapseTable('collapse-aggregated-sessionstat',
-                'aggregated-sessionstat')">
+      <span id="sessionstat" class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-sessionstat"
+            aria-expanded="true" aria-controls="aggregated-sessionstat"
+            data-collapse-name="collapse-aggregated-sessionstat">
         <h4>
           <span class="collapse-table-arrow arrow-open"></span>
           <a>Session Statistics ({numSessions})</a>
         </h4>
       </span> ++
-        <div class="aggregated-sessionstat collapsible-table">
+        <div class="collapsible-table collapse show" id="aggregated-sessionstat">
           {table.getOrElse("No statistics have been generated yet.")}
         </div>
 
@@ -274,10 +288,11 @@ private[ui] class SqlStatsPagedTable(
         <a href={sqlURL(request, sqlExecId)}>[{sqlExecId}]</a>
       }
     }
-    val sessionLink = "%s/%s/session/?id=%s".format(
+    val sessionLink = "%s/%s/session/?id=%s&userId=%s".format(
       UIUtils.prependBaseUri(request, parent.basePath),
       parent.prefix,
-      info.sessionId)
+      URLEncoder.encode(info.sessionId, UTF_8.name()),
+      ConnectUiUtils.encodeUserId(info.userId))
 
     <tr>
       <td>
@@ -404,10 +419,11 @@ private[ui] class SessionStatsPagedTable(
   }
 
   override def row(session: SessionInfo): Seq[Node] = {
-    val sessionLink = "%s/%s/session/?id=%s".format(
+    val sessionLink = "%s/%s/session/?id=%s&userId=%s".format(
       UIUtils.prependBaseUri(request, parent.basePath),
       parent.prefix,
-      session.sessionId)
+      URLEncoder.encode(session.sessionId, UTF_8.name()),
+      ConnectUiUtils.encodeUserId(session.userId))
     <tr>
       <td> {session.userId} </td>
       <td> <a href={sessionLink}> {session.sessionId} </a> </td>

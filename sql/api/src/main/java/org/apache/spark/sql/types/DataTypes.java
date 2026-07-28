@@ -206,7 +206,7 @@ public class DataTypes {
 
   /**
    * Creates a MapType by specifying the data type of keys ({@code keyType}) and values
-   * ({@code keyType}). The field of {@code valueContainsNull} is set to {@code true}.
+   * ({@code valueType}). The field of {@code valueContainsNull} is set to {@code true}.
    */
   public static MapType createMapType(DataType keyType, DataType valueType) {
     if (keyType == null) {
@@ -220,7 +220,7 @@ public class DataTypes {
 
   /**
    * Creates a MapType by specifying the data type of keys ({@code keyType}), the data type of
-   * values ({@code keyType}), and whether values contain any null value
+   * values ({@code valueType}), and whether values contain any null value
    * ({@code valueContainsNull}).
    */
   public static MapType createMapType(
@@ -302,7 +302,7 @@ public class DataTypes {
    * @since 4.0.0
    */
   public static CharType createCharType(int length) {
-    return new CharType(length);
+    return CharType$.MODULE$.apply(length);
   }
 
   /**
@@ -311,6 +311,6 @@ public class DataTypes {
    * @since 4.0.0
    */
   public static VarcharType createVarcharType(int length) {
-    return new VarcharType(length);
+    return VarcharType$.MODULE$.apply(length);
   }
 }

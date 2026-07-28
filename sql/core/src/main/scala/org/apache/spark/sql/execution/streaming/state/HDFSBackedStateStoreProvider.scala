@@ -81,6 +81,10 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
 
     override def get(key: UnsafeRow, colFamilyName: String): UnsafeRow = map.get(key)
 
+    override def multiGet(keys: Array[UnsafeRow], colFamilyName: String): Iterator[UnsafeRow] = {
+      keys.iterator.map(key => get(key, colFamilyName))
+    }
+
     override def iterator(colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
       val iter = map.iterator()
       new StateStoreIterator(iter)
@@ -107,6 +111,17 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
 
     override def allColumnFamilyNames: Set[String] =
       Set[String](StateStore.DEFAULT_COL_FAMILY_NAME)
+
+    override def prefixScanWithMultiValues(
+        prefixKey: UnsafeRow,
+        colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+      throw StateStoreErrors.unsupportedOperationException("multipleValuesPerKey", "HDFSStateStore")
+    }
+
+    override def iteratorWithMultiValues(
+        colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+      throw StateStoreErrors.unsupportedOperationException("multipleValuesPerKey", "HDFSStateStore")
+    }
   }
 
   /** Implementation of [[StateStore]] API which is backed by an HDFS-compatible file system */
@@ -134,7 +149,10 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
     private val newVersion = version + 1
     @volatile private var state: STATE = UPDATING
     private val finalDeltaFile: Path = deltaFile(newVersion)
-    private lazy val deltaFileStream = fm.createAtomic(finalDeltaFile, overwriteIfPossible = true)
+    private lazy val deltaFileStream = {
+      createBaseDirIfNotExists()
+      fm.createAtomic(finalDeltaFile, overwriteIfPossible = true)
+    }
     private lazy val compressedStream = compressStream(deltaFileStream)
 
     override def id: StateStoreId = HDFSBackedStateStoreProvider.this.stateStoreId
@@ -164,6 +182,11 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
     override def get(key: UnsafeRow, colFamilyName: String): UnsafeRow = {
       assertUseOfDefaultColFamily(colFamilyName)
       mapToUpdate.get(key)
+    }
+
+    override def multiGet(keys: Array[UnsafeRow], colFamilyName: String): Iterator[UnsafeRow] = {
+      assertUseOfDefaultColFamily(colFamilyName)
+      keys.iterator.map(key => mapToUpdate.get(key))
     }
 
     override def put(key: UnsafeRow, value: UnsafeRow, colFamilyName: String): Unit = {
@@ -219,6 +242,12 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
         case e: Throwable =>
           throw QueryExecutionErrors.failedToCommitStateFileError(this.toString(), e)
       }
+    }
+
+    override def release(): Unit = {
+      verify(state == UPDATING || state == RELEASED,
+        s"Cannot release after state $state")
+      state = RELEASED
     }
 
     /** Abort all the updates made on this store. This store will not be usable any more. */
@@ -313,6 +342,19 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
     override def mergeList(
         key: UnsafeRow, values: Array[UnsafeRow], colFamilyName: String): Unit = {
       throw StateStoreErrors.unsupportedOperationException("mergeList", providerName)
+    }
+
+    override def prefixScanWithMultiValues(
+        prefixKey: UnsafeRow,
+        colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+      throw StateStoreErrors.unsupportedOperationException(
+        "prefixScanWithMultiValues", providerName)
+    }
+
+    override def iteratorWithMultiValues(
+        colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+      throw StateStoreErrors.unsupportedOperationException(
+        "iteratorWithMultiValues", providerName)
     }
   }
 
@@ -436,7 +478,8 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
 
     this.numColsPrefixKey = getNumColsPrefixKey(keyStateEncoderSpec)
 
-    fm.mkdirs(baseDir)
+    // baseDir is created lazily on the first write -- see createBaseDirIfNotExists().
+    // This keeps read-only callers from issuing an mkdirs on the checkpoint path.
   }
 
   override def stateStoreId: StateStoreId = stateStoreId_
@@ -492,19 +535,42 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
   private lazy val loadedMaps = new util.TreeMap[Long, HDFSBackedStateStoreMap](
     Ordering[Long].reverse)
   private lazy val baseDir = stateStoreId.storeCheckpointLocation()
+
+  // baseDir is created lazily on the first write, so read-only entry points never trigger a
+  // mkdirs on the checkpoint path. compareAndSet ensures only one task issues the mkdirs even
+  // if several tasks for this partition race here; the flag is reset on failure so a transient
+  // mkdirs error does not permanently skip creation.
+  private val baseDirChecked = new AtomicBoolean(false)
+  private def createBaseDirIfNotExists(): Unit = {
+    if (baseDirChecked.compareAndSet(false, true)) {
+      try {
+        if (!fm.exists(baseDir)) fm.mkdirs(baseDir)
+      } catch {
+        case e: Throwable =>
+          baseDirChecked.set(false)
+          throw e
+      }
+    }
+  }
   // Visible to state pkg for testing.
   private[state] lazy val fm = {
     val mgr = CheckpointFileManager.create(baseDir, hadoopConf)
     if (storeConf.checkpointFileChecksumEnabled) {
+      // To avoid blocking, we need 2 threads per fm caller (one for main file, one for checksum
+      // file). Since this fm is used by both query task and maintenance thread, the recommended
+      // default is 2 * 2 = 4 threads. A value of 0 disables the thread pool (sequential mode).
+      val numThreads = storeConf.fileChecksumThreadPoolSize
+      if (numThreads < ChecksumCheckpointFileManager.DEFAULT_THREAD_POOL_SIZE) {
+        logWarning(s"fileChecksumThreadPoolSize for the state store file checksum thread pool " +
+          s"is set to $numThreads, which is below the recommended default of " +
+          s"${ChecksumCheckpointFileManager.DEFAULT_THREAD_POOL_SIZE}. " +
+          "This may have performance impact.")
+      }
       new ChecksumCheckpointFileManager(
         mgr,
         // Allowing this for perf, since we do orphan checksum file cleanup in maintenance anyway
         allowConcurrentDelete = true,
-        // We need 2 threads per fm caller to avoid blocking
-        // (one for main file and another for checksum file).
-        // Since this fm is used by both query task and maintenance thread,
-        // then we need 2 * 2 = 4 threads.
-        numThreads = 4,
+        numThreads = numThreads,
         skipCreationIfFileMissingChecksum =
           storeConf.checkpointFileChecksumSkipCreationIfFileMissingChecksum)
     } else {
@@ -527,7 +593,8 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
 
   private lazy val metricStateOnCurrentVersionSizeBytes: StateStoreCustomSizeMetric =
     StateStoreCustomSizeMetric("stateOnCurrentVersionSizeBytes",
-      "estimated size of state only on current version")
+      "estimated size of state only on current version",
+      isSnapshot = true)
 
   private lazy val metricLoadedMapCacheHit: StateStoreCustomMetric =
     StateStoreCustomSumMetric("loadedMapCacheHitCount",
@@ -692,7 +759,8 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
       storeIdStr) {
       override protected def beforeLoad(): Unit = {}
 
-      override protected def loadSnapshotFromCheckpoint(snapshotVersion: Long): Unit = {
+      override protected def loadSnapshotFromCheckpoint(
+          snapshotVersion: Long, uniqueId: Option[String]): Unit = {
         loadedMap = if (snapshotVersion <= 0) {
           // Use an empty map for versions 0 or less.
           Some(createHDFSBackedStateStoreMap())
@@ -705,7 +773,8 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
 
       override protected def onLoadSnapshotFromCheckpointFailure(): Unit = {}
 
-      override protected def getEligibleSnapshots(versionToLoad: Long): Seq[Long] = {
+      override protected def getEligibleSnapshots(
+          versionToLoad: Long): Seq[(Long, Option[String])] = {
         val snapshotVersions = SnapshotLoaderHelper.getEligibleSnapshotsForVersion(
           versionToLoad, fm, baseDir, onlySnapshotFiles, fileSuffix = ".snapshot")
 
@@ -715,7 +784,7 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
         }.filter(_ <= versionToLoad)
 
         // Combine the two sets of versions, so we can check both during load
-        (snapshotVersions ++ cachedVersions).distinct
+        (snapshotVersions ++ cachedVersions).distinct.map((_, None))
       }
     }
 
@@ -848,6 +917,7 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
     var rawOutput: CancellableFSDataOutputStream = null
     var output: DataOutputStream = null
     try {
+      createBaseDirIfNotExists()
       rawOutput = fm.createAtomic(targetFile, overwriteIfPossible = true)
       output = compressStream(rawOutput)
       // Entry iterator doesn't do verification, we will do it ourselves
@@ -1007,7 +1077,7 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
       if (files.nonEmpty) {
         val lastVersion = files.last.version
         val deltaFilesForLastVersion =
-          filesForVersion(files, lastVersion).filter(_.isSnapshot == false)
+          filesForVersion(files, lastVersion).filterNot(_.isSnapshot)
         synchronized { Option(loadedMaps.get(lastVersion)) } match {
           case Some(map) =>
             if (deltaFilesForLastVersion.size > storeConf.minDeltasForSnapshot) {
@@ -1190,6 +1260,12 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
         "HDFSBackedStateStoreProvider does not support checkpointFormatVersion > 1 " +
         "but a state store checkpointID is passed in")
     }
+    // The trait's return type is StateStore (writable), so we cannot return
+    // HDFSBackedReadStateStore here. Callers that need a read-only store must call
+    // replayReadStateFromSnapshot instead.
+    require(!readOnly,
+      "HDFSBackedStateStoreProvider.replayStateFromSnapshot cannot return a read-only " +
+        "store; use replayReadStateFromSnapshot when readOnly = true.")
     val newMap = replayLoadedMapFromSnapshot(snapshotVersion, endVersion)
     logInfo(log"Retrieved snapshot at version " +
       log"${MDC(LogKeys.STATE_STORE_VERSION, snapshotVersion)} and apply delta files to version " +

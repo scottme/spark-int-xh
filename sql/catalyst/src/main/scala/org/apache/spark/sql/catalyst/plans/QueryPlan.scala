@@ -21,11 +21,12 @@ import java.lang.{Boolean => JBoolean}
 import java.util.IdentityHashMap
 
 import scala.collection.mutable
+import scala.util.control.NonFatal
 
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.SQLConfHelper
-import org.apache.spark.sql.catalyst.analysis.UnresolvedException
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.plans.logical.AnalysisHelper
 import org.apache.spark.sql.catalyst.rules.RuleId
 import org.apache.spark.sql.catalyst.rules.UnknownRuleId
 import org.apache.spark.sql.catalyst.trees.{AlwaysProcess, CurrentOrigin, TreeNode, TreeNodeTag}
@@ -56,6 +57,15 @@ abstract class QueryPlan[PlanType <: QueryPlan[PlanType]]
 
   def output: Seq[Attribute]
 
+  /**
+   * Returns a string representation of this node with output column information appended,
+   * including each column's nullability. If `output` has more than `maxColumns` entries, only the
+   * first `maxColumns` are shown with a count of the remaining ones.
+   * If we encounter a [[NonFatal]], it's high likely that the call of `this.output`
+   * ([[UnresolvedException]] by calling e.g. `dataType` on unresolved expression or
+   * [[CANNOT_MERGE_INCOMPATIBLE_DATA_TYPE]] by calling `Union.output` before type coercing it)
+   * throws it. In this case, falls back to showing just the node name.
+   */
   override def nodeWithOutputColumnsString(maxColumns: Int): String = {
     try {
       nodeName + {
@@ -75,9 +85,7 @@ abstract class QueryPlan[PlanType <: QueryPlan[PlanType]]
         }
       }
     } catch {
-      case _: UnresolvedException =>
-        // If we encounter an UnresolvedException, it's high likely that the call of `this.output`
-        // throws it. In this case, we may have to give up and only show the nodeName.
+      case NonFatal(_) =>
         nodeName + " <output='Unresolved'>"
     }
   }
@@ -623,11 +631,23 @@ abstract class QueryPlan[PlanType <: QueryPlan[PlanType]]
    * A variant of [[foreach]] which considers plan nodes inside subqueries as well.
    */
   def foreachWithSubqueries(f: PlanType => Unit): Unit = {
-    def actualFunc(plan: PlanType): Unit = {
-      f(plan)
-      plan.subqueries.foreach(_.foreachWithSubqueries(f))
+    f(this)
+    subqueries.foreach(_.foreachWithSubqueries(f))
+    children.foreach(_.foreachWithSubqueries(f))
+  }
+
+  /**
+   * A variant of [[foreachWithSubqueries]] with pruning support.
+   * Only traverses nodes that match the given condition.
+   */
+  def foreachWithSubqueriesAndPruning(
+      cond: TreePatternBits => Boolean)(f: PlanType => Unit): Unit = {
+    if (!cond.apply(this)) {
+      return
     }
-    foreach(actualFunc)
+    f(this)
+    subqueries.foreach(_.foreachWithSubqueriesAndPruning(cond)(f))
+    children.foreach(_.foreachWithSubqueriesAndPruning(cond)(f))
   }
 
   /**
@@ -779,9 +799,10 @@ object QueryPlan extends PredicateHelper {
     e.transformUp {
       case s: PlanExpression[QueryPlan[_] @unchecked] =>
         // Normalize the outer references in the subquery plan.
-        val normalizedPlan = s.plan.transformAllExpressionsWithPruning(
-          _.containsPattern(OUTER_REFERENCE)) {
-          case OuterReference(r) => OuterReference(QueryPlan.normalizeExpressions(r, input))
+        val normalizedPlan = AnalysisHelper.allowInvokingTransformsInAnalyzer {
+          s.plan.transformAllExpressionsWithPruning(_.containsPattern(OUTER_REFERENCE)) {
+            case OuterReference(r) => OuterReference(QueryPlan.normalizeExpressions(r, input))
+          }
         }
         s.withNewPlan(normalizedPlan)
 

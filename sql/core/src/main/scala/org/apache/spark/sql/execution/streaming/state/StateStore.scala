@@ -116,6 +116,19 @@ trait ReadStateStore {
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): UnsafeRow
 
   /**
+   * Get the values for multiple keys in a single batch operation.
+   * Default implementation throws UnsupportedOperationException.
+   * Providers that support batch retrieval should override this method.
+   *
+   * @param keys          Array of keys to look up
+   * @param colFamilyName The column family name
+   * @return Iterator of values corresponding to the keys (null for keys that don't exist)
+   */
+  def multiGet(keys: Array[UnsafeRow], colFamilyName: String): Iterator[UnsafeRow] = {
+    throw new UnsupportedOperationException("multiGet is not supported by this StateStore")
+  }
+
+  /**
    * Check if a key exists in the store, with 100% guarantee of a correct result.
    *
    * Default implementation calls get() and checks if the result is null.
@@ -158,8 +171,74 @@ trait ReadStateStore {
       prefixKey: UnsafeRow,
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): StateStoreIterator[UnsafeRowPair]
 
+  /**
+   * Return an iterator containing all the (key, value) pairs which are matched with
+   * the given prefix key.
+   *
+   * It is expected to throw exception if Spark calls this method without proper key encoding spec.
+   * It is also expected to throw exception if Spark calls this method without setting
+   * multipleValuesPerKey as true for the column family.
+   */
+  def prefixScanWithMultiValues(
+      prefixKey: UnsafeRow,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): StateStoreIterator[UnsafeRowPair]
+
+  /**
+   * Scan key-value pairs in the range [startKey, endKey).
+   *
+   * @param startKey None to scan from the beginning of the column family,
+   *                 or Some(key) to seek to the given start position (inclusive).
+   * @param endKey   None to scan to the end of the column family,
+   *                 or Some(key) as the exclusive upper bound for the scan.
+   * @param colFamilyName The column family name.
+   *
+   * Callers must ensure the column family's key encoder produces lexicographically ordered
+   * bytes for the scan range to be meaningful (e.g., timestamp-based encoders or
+   * RangeKeyScanStateEncoder).
+   */
+  def rangeScan(
+      startKey: Option[UnsafeRow],
+      endKey: Option[UnsafeRow],
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
+    : StateStoreIterator[UnsafeRowPair] = {
+    throw StateStoreErrors.unsupportedOperationException("rangeScan", "")
+  }
+
+  /**
+   * Scan key-value pairs in the range [startKey, endKey), expanding multi-valued entries.
+   *
+   * @param startKey None to scan from the beginning of the column family,
+   *                 or Some(key) to seek to the given start position (inclusive).
+   * @param endKey   None to scan to the end of the column family,
+   *                 or Some(key) as the exclusive upper bound for the scan.
+   * @param colFamilyName The column family name.
+   *
+   * Callers must ensure the column family's key encoder produces lexicographically ordered
+   * bytes for the scan range to be meaningful (e.g., timestamp-based encoders or
+   * RangeKeyScanStateEncoder).
+   *
+   * It is expected to throw exception if Spark calls this method without setting
+   * multipleValuesPerKey as true for the column family.
+   */
+  def rangeScanWithMultiValues(
+      startKey: Option[UnsafeRow],
+      endKey: Option[UnsafeRow],
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
+    : StateStoreIterator[UnsafeRowPair] = {
+    throw StateStoreErrors.unsupportedOperationException("rangeScanWithMultiValues", "")
+  }
+
   /** Return an iterator containing all the key-value pairs in the StateStore. */
   def iterator(
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): StateStoreIterator[UnsafeRowPair]
+
+  /**
+   * Return an iterator containing all the key-value pairs in the StateStore.
+   *
+   * It is expected to throw exception if Spark calls this method without setting
+   * multipleValuesPerKey as true for the column family.
+   */
+  def iteratorWithMultiValues(
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): StateStoreIterator[UnsafeRowPair]
 
   /**
@@ -191,6 +270,22 @@ trait ReadStateStore {
    * @return Set of all column family names
    */
   def allColumnFamilyNames: Set[String]
+
+  /**
+   * Read-only counterpart of [[StateStore.createColFamilyIfAbsent]]: a purely in-memory
+   * registration of the column family's id and encoders so reads can decode it. Must not write
+   * to the checkpoint or carry write intent (e.g. forcing a snapshot).
+   */
+  def registerColFamily(
+      colFamilyName: String,
+      keySchema: StructType,
+      valueSchema: StructType,
+      keyStateEncoderSpec: KeyStateEncoderSpec,
+      useMultipleValuesPerKey: Boolean = false,
+      isInternal: Boolean = false): Unit = {
+    throw new UnsupportedOperationException(
+      "registerColFamily is not supported by this ReadStateStore")
+  }
 }
 
 /**
@@ -248,6 +343,21 @@ trait StateStore extends ReadStateStore {
   def remove(
       key: UnsafeRow,
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
+
+  /**
+   * Delete all keys in the range [beginKey, endKey).
+   * Uses RocksDB's native deleteRange for efficient bulk deletion.
+   *
+   * @param beginKey      The start key of the range (inclusive)
+   * @param endKey        The end key of the range (exclusive)
+   * @param colFamilyName The column family name
+   */
+  def deleteRange(
+      beginKey: UnsafeRow,
+      endKey: UnsafeRow,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit = {
+    throw new UnsupportedOperationException("deleteRange is not supported by this StateStore")
+  }
 
   /**
    * Merges the provided value with existing values of a non-null key. If a existing
@@ -329,6 +439,10 @@ class WrappedReadStateStore(store: StateStore) extends ReadStateStore {
     colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): UnsafeRow = store.get(key,
     colFamilyName)
 
+  override def multiGet(keys: Array[UnsafeRow], colFamilyName: String): Iterator[UnsafeRow] = {
+    store.multiGet(keys, colFamilyName)
+  }
+
   override def keyExists(
       key: UnsafeRow,
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Boolean = {
@@ -351,6 +465,47 @@ class WrappedReadStateStore(store: StateStore) extends ReadStateStore {
   }
 
   override def allColumnFamilyNames: Set[String] = store.allColumnFamilyNames
+
+  override def prefixScanWithMultiValues(
+      prefixKey: UnsafeRow,
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    store.prefixScanWithMultiValues(prefixKey, colFamilyName)
+  }
+
+  override def rangeScan(
+      startKey: Option[UnsafeRow],
+      endKey: Option[UnsafeRow],
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    store.rangeScan(startKey, endKey, colFamilyName)
+  }
+
+  override def rangeScanWithMultiValues(
+      startKey: Option[UnsafeRow],
+      endKey: Option[UnsafeRow],
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    store.rangeScanWithMultiValues(startKey, endKey, colFamilyName)
+  }
+
+  override def iteratorWithMultiValues(
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    store.iteratorWithMultiValues(colFamilyName)
+  }
+
+  // Registering a column family is a purely in-memory operation (virtual column family id and
+  // key/value encoders); it does not touch the native store or write to the checkpoint. Reads
+  // cannot decode a column family that has not been registered, so this is delegated to the
+  // underlying store via its read-safe registerColFamily rather than rejected.
+  override def registerColFamily(
+      colFamilyName: String,
+      keySchema: StructType,
+      valueSchema: StructType,
+      keyStateEncoderSpec: KeyStateEncoderSpec,
+      useMultipleValuesPerKey: Boolean = false,
+      isInternal: Boolean = false): Unit = {
+    store.registerColFamily(
+      colFamilyName, keySchema, valueSchema, keyStateEncoderSpec,
+      useMultipleValuesPerKey, isInternal)
+  }
 }
 
 /**
@@ -414,6 +569,10 @@ trait StateStoreCustomMetric {
   def desc: String
   def withNewDesc(desc: String): StateStoreCustomMetric
   def createSQLMetric(sparkContext: SparkContext): SQLMetric
+
+  // True if the metric reflects current store state (e.g. file size, memory) rather
+  // than per-batch work; snapshot metrics are preserved on no-data trigger events.
+  def isSnapshot: Boolean = false
 }
 
 case class StateStoreCustomSumMetric(name: String, desc: String) extends StateStoreCustomMetric {
@@ -423,7 +582,10 @@ case class StateStoreCustomSumMetric(name: String, desc: String) extends StateSt
     SQLMetrics.createMetric(sparkContext, desc)
 }
 
-case class StateStoreCustomSizeMetric(name: String, desc: String) extends StateStoreCustomMetric {
+case class StateStoreCustomSizeMetric(
+    name: String,
+    desc: String,
+    override val isSnapshot: Boolean = false) extends StateStoreCustomMetric {
   override def withNewDesc(desc: String): StateStoreCustomSizeMetric = copy(desc = desc)
 
   override def createSQLMetric(sparkContext: SparkContext): SQLMetric =
@@ -547,6 +709,10 @@ object KeyStateEncoderSpec {
       case "PrefixKeyScanStateEncoderSpec" =>
         val numColsPrefixKey = m("numColsPrefixKey").asInstanceOf[BigInt].toInt
         PrefixKeyScanStateEncoderSpec(keySchema, numColsPrefixKey)
+      case "TimestampAsPostfixKeyStateEncoderSpec" =>
+        TimestampAsPostfixKeyStateEncoderSpec(keySchema)
+      case "TimestampAsPrefixKeyStateEncoderSpec" =>
+        TimestampAsPrefixKeyStateEncoderSpec(keySchema)
     }
   }
 }
@@ -602,6 +768,42 @@ case class RangeKeyScanStateEncoderSpec(
   override def jsonValue: JValue = {
     ("keyStateEncoderType" -> JString("RangeKeyScanStateEncoderSpec")) ~
       ("orderingOrdinals" -> orderingOrdinals.map(JInt(_)))
+  }
+}
+
+/**
+ * The encoder specification for [[TimestampAsPrefixKeyStateEncoder]].
+ * The encoder expects the provided key schema to have [original key fields..., timestamp field].
+ */
+case class TimestampAsPrefixKeyStateEncoderSpec(keySchema: StructType)
+  extends KeyStateEncoderSpec {
+
+  override def toEncoder(
+      dataEncoder: RocksDBDataEncoder,
+      useColumnFamilies: Boolean): RocksDBKeyStateEncoder = {
+    new TimestampAsPrefixKeyStateEncoder(dataEncoder, keySchema, useColumnFamilies)
+  }
+
+  override def jsonValue: JValue = {
+    "keyStateEncoderType" -> JString("TimestampAsPrefixKeyStateEncoderSpec")
+  }
+}
+
+/**
+ * The encoder specification for [[TimestampAsPostfixKeyStateEncoder]].
+ * The encoder expects the provided key schema to have [original key fields..., timestamp field].
+ */
+case class TimestampAsPostfixKeyStateEncoderSpec(keySchema: StructType)
+  extends KeyStateEncoderSpec {
+
+  override def toEncoder(
+      dataEncoder: RocksDBDataEncoder,
+      useColumnFamilies: Boolean): RocksDBKeyStateEncoder = {
+    new TimestampAsPostfixKeyStateEncoder(dataEncoder, keySchema, useColumnFamilies)
+  }
+
+  override def jsonValue: JValue = {
+    "keyStateEncoderType" -> JString("TimestampAsPostfixKeyStateEncoderSpec")
   }
 }
 
@@ -884,7 +1086,7 @@ object StateStoreProvider extends Logging {
   private[state] def coordinatorRef: Option[StateStoreCoordinatorRef] = synchronized {
     val env = SparkEnv.get
     if (env != null) {
-      val isDriver = env.executorId == SparkContext.DRIVER_IDENTIFIER
+      val isDriver = SparkContext.isDriver(env.executorId)
       // If running locally, then the coordinator reference in stateStoreCoordinatorRef may have
       // become inactive as SparkContext + SparkEnv may have been restarted. Hence, when running in
       // driver, always recreate the reference.
@@ -1047,7 +1249,6 @@ class UnsafeRowPair(var key: UnsafeRow = null, var value: UnsafeRow = null) {
     this
   }
 }
-
 
 /**
  * Companion object to [[StateStore]] that provides helper methods to create and retrieve stores
@@ -1662,8 +1863,7 @@ object StateStore extends Logging {
   private def coordinatorRef: Option[StateStoreCoordinatorRef] = loadedProviders.synchronized {
     val env = SparkEnv.get
     if (env != null) {
-      val isDriver =
-        env.executorId == SparkContext.DRIVER_IDENTIFIER
+      val isDriver = SparkContext.isDriver(env.executorId)
       // If running locally, then the coordinator reference in _coordRef may be have become inactive
       // as SparkContext + SparkEnv may have been restarted. Hence, when running in driver,
       // always recreate the reference.

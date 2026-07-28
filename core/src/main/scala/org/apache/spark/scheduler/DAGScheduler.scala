@@ -46,8 +46,8 @@ import org.apache.spark.network.shuffle.protocol.MergeStatuses
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.partial.{ApproximateActionListener, ApproximateEvaluator, PartialResult}
 import org.apache.spark.rdd.{RDD, RDDCheckpointData}
-import org.apache.spark.resource.{ResourceProfile, TaskResourceProfile}
-import org.apache.spark.resource.ResourceProfile.{DEFAULT_RESOURCE_PROFILE_ID, EXECUTOR_CORES_LOCAL_PROPERTY, PYSPARK_MEMORY_LOCAL_PROPERTY}
+import org.apache.spark.resource.{CpuAmount, ResourceProfile, TaskResourceProfile}
+import org.apache.spark.resource.ResourceProfile.{CPUS, DEFAULT_RESOURCE_PROFILE_ID, EXECUTOR_CORES_LOCAL_PROPERTY, MAX_TASKS_PER_EXECUTOR_LOCAL_PROPERTY, PYSPARK_MEMORY_LOCAL_PROPERTY}
 import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.rpc.RpcTimeoutException
 import org.apache.spark.storage._
@@ -169,7 +169,107 @@ private[spark] class DAGScheduler(
   // Stages that must be resubmitted due to fetch failures
   private[scheduler] val failedStages = new HashSet[Stage]
 
+  /**
+   * Deferred completion for pipelined groups. When a stage (a "pipelined consumer") is co-scheduled
+   * with a pipelined producer that is still running, the stage/job-completion decision from
+   * its successful task-completion events must not be processed yet: doing so could finish the
+   * consumer's job and cancel the still-running producer, or make the consumer's output observable
+   * before the producer's. We buffer such events here and replay them once every pipelined producer
+   * the consumer was waiting on has finished.
+   *
+   * Keyed by the consumer stage. `parents` is the set of its pipelined producer stages not yet
+   * finished; `delayedTaskCompletionEvents` are its Success CompletionEvents held until then.
+   * Entries exist only for stages that were co-scheduled with a not-yet-finished pipelined
+   * producer, so this is empty for any job without a pipelined dependency.
+   */
+  private[scheduler] case class DependentStageInfo(
+      parents: HashSet[Stage] = new HashSet[Stage],
+      delayedTaskCompletionEvents: ListBuffer[CompletionEvent] = new ListBuffer[CompletionEvent])
+  private[scheduler] val dependentStageMap = new HashMap[Stage, DependentStageInfo]
+
   private[scheduler] val activeJobs = new HashSet[ActiveJob]
+
+  // Track all the jobs submitted by the same query execution, will clean up after
+  // the query finishes. Use ConcurrentHashMap to allow thread-safe access from
+  // different threads (e.g., SQLExecution during testing).
+  private[spark] val activeQueryToJobs =
+    new ConcurrentHashMap[Long, java.util.Set[ActiveJob]]()
+
+  private[spark] val jobIdToQueryExecutionId = new ConcurrentHashMap[Int, java.lang.Long]()
+
+  // The maps below back the test-only INJECT_SHUFFLE_FETCH_FAILURES machinery, keyed by the
+  // globally-unique (never-reused) shuffleId. They are always allocated rather than gated on
+  // `Utils.isTesting`: that helper reads the mutable `spark.testing` system property, so it can
+  // return a different value when this DAGScheduler is constructed than at the later use-sites.
+  // A construction-time `else null` would then be dereferenced by a use-site that re-checks
+  // `Utils.isTesting` and sees `true`, throwing an NPE that crashes the event loop. The maps are
+  // only ever populated inside the config-gated test paths, so in production they stay empty and
+  // carry no behavioral cost beyond an empty map. Entries are evicted when the shuffle's map
+  // outputs are unregistered (via the CleanerListener attached lazily in
+  // ensureInjectShuffleFetchFailuresCleanerListenerForTest), not on stage removal: under AQE each
+  // Exchange is materialized as its own map-stage job whose stage is removed before the consuming
+  // stage runs, so evicting on stage removal would drop a pending corruption before its consumer
+  // is ever submitted.
+
+  // For INJECT_SHUFFLE_FETCH_FAILURES: per-shuffleId, the stage attempt whose partition-0 task
+  // we corrupted. Read to (a) avoid re-corrupting that partition on recompute, and (b) decide
+  // when to fire INJECT_SHUFFLE_FORCE_CHECKSUM_MISMATCH_ON_RECOMPUTE - the recompute is the
+  // task whose stageAttemptId is not the recorded one.
+  private val injectShuffleFetchFailuresCorruptedAttempt: ConcurrentHashMap[Int, Int] =
+    new ConcurrentHashMap[Int, Int]()
+
+  // For INJECT_SHUFFLE_FETCH_FAILURES_DOWNSTREAM_DELAY > 0: shuffles whose mapper-0 corruption
+  // has been deferred until enough downstream consumer tasks succeed. The value is the mapId
+  // we will eventually swap to an invalid BlockManagerId and the producing task's original
+  // location - we keep that location's host/port so the consumer's locality-preferred host
+  // is still a real one (only the executorId is INVALID_EXECUTOR_ID).
+  private val injectShuffleFetchFailuresPendingDelayedCorruption
+    : ConcurrentHashMap[Int, (Long, BlockManagerId)] =
+    new ConcurrentHashMap[Int, (Long, BlockManagerId)]()
+
+  // For INJECT_SHUFFLE_FETCH_FAILURES_DOWNSTREAM_DELAY: per-shuffle counter of consumer
+  // task-success events observed so far.
+  private val injectShuffleFetchFailuresDownstreamSuccessCount: ConcurrentHashMap[Int, Int] =
+    new ConcurrentHashMap[Int, Int]()
+
+  // Whether the CleanerListener that evicts the injectShuffleFetchFailures* maps on shuffle
+  // cleanup has been attached. Attached lazily (not in the constructor) because sc.cleaner is
+  // created after the DAGScheduler.
+  @volatile private var injectShuffleFetchFailuresCleanerAttached = false
+
+  // Lazily attach a CleanerListener that drops a shuffle's injectShuffleFetchFailures* entries
+  // when its map outputs are unregistered. Called from the test-gated injection path only, so it
+  // never runs in production. Runs on the single-threaded event loop, hence no extra locking.
+  private def ensureInjectShuffleFetchFailuresCleanerListenerForTest(): Unit = {
+    if (injectShuffleFetchFailuresCleanerAttached) return
+    sc.cleaner.foreach { cleaner =>
+      cleaner.attachListener(new CleanerListener {
+        override def rddCleaned(rddId: Int): Unit = {}
+        override def shuffleCleaned(shuffleId: Int): Unit = {
+          injectShuffleFetchFailuresCorruptedAttempt.remove(shuffleId)
+          injectShuffleFetchFailuresPendingDelayedCorruption.remove(shuffleId)
+          injectShuffleFetchFailuresDownstreamSuccessCount.remove(shuffleId)
+        }
+        override def broadcastCleaned(broadcastId: Long): Unit = {}
+        override def accumCleaned(accId: Long): Unit = {}
+        override def checkpointCleaned(rddId: Long): Unit = {}
+      })
+      injectShuffleFetchFailuresCleanerAttached = true
+    }
+  }
+
+  // Build the bogus BlockManagerId used by INJECT_SHUFFLE_FETCH_FAILURES to mark a corrupted
+  // MapStatus: keeps the original host/port/topology so the consumer's locality preference
+  // resolves to a real host; only the executorId is INVALID_EXECUTOR_ID, so any fetch from
+  // this location fails with FetchFailed.
+  private def injectShuffleFetchFailuresInvalidBlockManagerId(
+      currentLocation: BlockManagerId): BlockManagerId = {
+    BlockManagerId(
+      BlockManagerId.INVALID_EXECUTOR_ID,
+      currentLocation.host,
+      currentLocation.port,
+      currentLocation.topologyInfo)
+  }
 
   // Job groups that are cancelled with `cancelFutureJobs` as true, with at most
   // `NUM_CANCELLED_JOB_GROUPS_TO_TRACK` stored. On a new job submission, if its job group is in
@@ -239,15 +339,54 @@ private[spark] class DAGScheduler(
 
   /**
    * Number of consecutive stage attempts allowed before a stage is aborted.
+   * The consecutive counter is cleared when a stage succeeds, so failures from different
+   * "runs" of the same stage do not accumulate against this limit.
+   * See [[stageAbortReason]] for how this interacts with [[maxStageAttempts]].
    */
   private[scheduler] val maxConsecutiveStageAttempts =
     sc.conf.get(config.STAGE_MAX_CONSECUTIVE_ATTEMPTS)
 
   /**
-   * Max stage attempts allowed before a stage is aborted.
+   * Absolute ceiling on the total number of attempts ever made for a stage (consecutive or not).
+   * Computed as the maximum of [[maxConsecutiveStageAttempts]] and the configured value of
+   * [[config.STAGE_MAX_ATTEMPTS]], so that the total ceiling is never lower than the consecutive
+   * limit. See [[stageAbortReason]] for how this interacts with [[maxConsecutiveStageAttempts]].
    */
   private[scheduler] val maxStageAttempts: Int = {
     Math.max(maxConsecutiveStageAttempts, sc.conf.get(config.STAGE_MAX_ATTEMPTS))
+  }
+
+  /**
+   * If the stage must be aborted, returns `Some(abortMessage)` describing which limit was hit.
+   * If the stage may be retried, returns `None`.
+   *
+   * Two independent limits are enforced; whichever triggers first causes the stage to be aborted:
+   *  - [[maxConsecutiveStageAttempts]]: caps the number of *consecutive* failed attempts.
+   *    This counter is reset when the stage succeeds, so transient failures in a long-running
+   *    job do not permanently accumulate.
+   *  - [[maxStageAttempts]]: an absolute ceiling on the *total* number of attempts ever made
+   *    for a stage. The attempt counter it bounds (`nextAttemptId`) is never cleared.
+   *
+   * Additionally, if the test-only flag [[disallowStageRetryForTest]] is set, the stage is
+   * aborted regardless of the above limits.
+   */
+  private def stageAbortReason(
+      stage: Stage,
+      failureMessage: String): Option[String] = {
+    if (disallowStageRetryForTest) {
+      Some(s"$stage (${stage.name}) will not retry due to testing config." +
+        s" Most recent failure reason: $failureMessage")
+    } else if (stage.failedAttemptIds.size >= maxConsecutiveStageAttempts) {
+      Some(s"$stage (${stage.name}) has failed the maximum allowable" +
+        s" number of times: $maxConsecutiveStageAttempts." +
+        s" Most recent failure reason: $failureMessage")
+    } else if (stage.getNextAttemptId >= maxStageAttempts) {
+      Some(s"$stage (${stage.name}) has exceeded the maximum allowable" +
+        s" total stage attempts: $maxStageAttempts." +
+        s" Most recent failure reason: $failureMessage")
+    } else {
+      None
+    }
   }
 
   /**
@@ -277,6 +416,16 @@ private[spark] class DAGScheduler(
 
   private val messageScheduler =
     ThreadUtils.newDaemonSingleThreadScheduledExecutor("dag-scheduler-message")
+
+  private def scheduleResubmit(): Unit = {
+    messageScheduler.schedule(
+      new Runnable {
+        override def run(): Unit = eventProcessLoop.post(ResubmitFailedStages)
+      },
+      DAGScheduler.RESUBMIT_TIMEOUT,
+      TimeUnit.MILLISECONDS
+    )
+  }
 
   private[spark] var eventProcessLoop = new DAGSchedulerEventProcessLoop(this)
   // Used for test only. Some tests uses the same thread of the event poster to
@@ -675,26 +824,54 @@ private[spark] class DAGScheduler(
     }.toList
   }
 
-  /** Find ancestor shuffle dependencies that are not registered in shuffleToMapStage yet */
-  private def getMissingAncestorShuffleDependencies(
-      rdd: RDD[_]): ListBuffer[ShuffleDependency[_, _, _]] = {
-    val ancestors = new ListBuffer[ShuffleDependency[_, _, _]]
+  /**
+   * Like [[traverseRDDGraphUntil]], but does not support early termination. For each unvisited RDD,
+   * calls `visitor(rdd, enqueue)` where `enqueue` can be called to schedule additional RDDs for
+   * traversal.
+   */
+  private def traverseRDDGraph(rdd: RDD[_])(visitor: (RDD[_], RDD[_] => Unit) => Unit): Unit = {
+    traverseRDDGraphUntil(rdd) { (r, enqueue) =>
+      visitor(r, enqueue)
+      true
+    }
+  }
+
+  /**
+   * Traverses the RDD dependency graph using a manually maintained stack to prevent
+   * StackOverflowError caused by recursive traversal. For each unvisited RDD, calls
+   * `visitor(rdd, enqueue)` where `enqueue` can be called to schedule additional RDDs for
+   * traversal. If `visitor` returns `false`, the traversal stops immediately. Returns `true`
+   * if the traversal completed normally, `false` if it was terminated early by the visitor.
+   */
+  private def traverseRDDGraphUntil(
+      rdd: RDD[_])(visitor: (RDD[_], RDD[_] => Unit) => Boolean): Boolean = {
     val visited = new HashSet[RDD[_]]
-    // We are manually maintaining a stack here to prevent StackOverflowError
-    // caused by recursively visiting
     val waitingForVisit = new ListBuffer[RDD[_]]
     waitingForVisit += rdd
+    def enqueue(r: RDD[_]): Unit = waitingForVisit.prepend(r)
     while (waitingForVisit.nonEmpty) {
       val toVisit = waitingForVisit.remove(0)
       if (!visited(toVisit)) {
         visited += toVisit
-        val (shuffleDeps, _) = getShuffleDependenciesAndResourceProfiles(toVisit)
-        shuffleDeps.foreach { shuffleDep =>
-          if (!shuffleIdToMapStage.contains(shuffleDep.shuffleId)) {
-            ancestors.prepend(shuffleDep)
-            waitingForVisit.prepend(shuffleDep.rdd)
-          } // Otherwise, the dependency and its ancestors have already been registered.
+        if (!visitor(toVisit, enqueue)) {
+          return false
         }
+      }
+    }
+    true
+  }
+
+  /** Find ancestor shuffle dependencies that are not registered in shuffleIdToMapStage yet */
+  private def getMissingAncestorShuffleDependencies(
+      rdd: RDD[_]): ListBuffer[ShuffleDependency[_, _, _]] = {
+    val ancestors = new ListBuffer[ShuffleDependency[_, _, _]]
+    traverseRDDGraph(rdd) { (toVisit, enqueue) =>
+      val (shuffleDeps, _) = getShuffleDependenciesAndResourceProfiles(toVisit)
+      shuffleDeps.foreach { shuffleDep =>
+        if (!shuffleIdToMapStage.contains(shuffleDep.shuffleId)) {
+          ancestors.prepend(shuffleDep)
+          enqueue(shuffleDep.rdd)
+        } // Otherwise, the dependency and its ancestors have already been registered.
       }
     }
     ancestors
@@ -717,20 +894,13 @@ private[spark] class DAGScheduler(
       rdd: RDD[_]): (HashSet[ShuffleDependency[_, _, _]], HashSet[ResourceProfile]) = {
     val parents = new HashSet[ShuffleDependency[_, _, _]]
     val resourceProfiles = new HashSet[ResourceProfile]
-    val visited = new HashSet[RDD[_]]
-    val waitingForVisit = new ListBuffer[RDD[_]]
-    waitingForVisit += rdd
-    while (waitingForVisit.nonEmpty) {
-      val toVisit = waitingForVisit.remove(0)
-      if (!visited(toVisit)) {
-        visited += toVisit
-        Option(toVisit.getResourceProfile()).foreach(resourceProfiles += _)
-        toVisit.dependencies.foreach {
-          case shuffleDep: ShuffleDependency[_, _, _] =>
-            parents += shuffleDep
-          case dependency =>
-            waitingForVisit.prepend(dependency.rdd)
-        }
+    traverseRDDGraph(rdd) { (toVisit, enqueue) =>
+      Option(toVisit.getResourceProfile()).foreach(resourceProfiles += _)
+      toVisit.dependencies.foreach {
+        case shuffleDep: ShuffleDependency[_, _, _] =>
+          parents += shuffleDep
+        case dependency =>
+          enqueue(dependency.rdd)
       }
     }
     (parents, resourceProfiles)
@@ -741,99 +911,164 @@ private[spark] class DAGScheduler(
    * RDDs satisfy a given predicate.
    */
   private def traverseParentRDDsWithinStage(rdd: RDD[_], predicate: RDD[_] => Boolean): Boolean = {
-    val visited = new HashSet[RDD[_]]
-    val waitingForVisit = new ListBuffer[RDD[_]]
-    waitingForVisit += rdd
-    while (waitingForVisit.nonEmpty) {
-      val toVisit = waitingForVisit.remove(0)
-      if (!visited(toVisit)) {
-        if (!predicate(toVisit)) {
-          return false
-        }
-        visited += toVisit
+    traverseRDDGraphUntil(rdd) { (toVisit, enqueue) =>
+      if (!predicate(toVisit)) {
+        false
+      } else {
         toVisit.dependencies.foreach {
           case _: ShuffleDependency[_, _, _] =>
-            // Not within the same stage with current rdd, do nothing.
+            // Not within the same stage as the current RDD, do nothing.
           case dependency =>
-            waitingForVisit.prepend(dependency.rdd)
+            enqueue(dependency.rdd)
         }
+        true
       }
     }
-    true
   }
 
   private def getMissingParentStages(stage: Stage): List[Stage] = {
     val missing = new HashSet[Stage]
-    val visited = new HashSet[RDD[_]]
-    // We are manually maintaining a stack here to prevent StackOverflowError
-    // caused by recursively visiting
-    val waitingForVisit = new ListBuffer[RDD[_]]
-    waitingForVisit += stage.rdd
-    def visit(rdd: RDD[_]): Unit = {
-      if (!visited(rdd)) {
-        visited += rdd
-        val rddHasUncachedPartitions = try {
-          getCacheLocs(rdd).contains(Nil)
-        } catch {
-          case e: RpcTimeoutException =>
-            logWarning(log"Failed to get cache locations for RDD ${MDC(RDD_ID, rdd.id)} due " +
-              log"to rpc timeout, assuming not fully cached.", e)
-            true
-        }
-        if (rddHasUncachedPartitions) {
-          for (dep <- rdd.dependencies) {
-            dep match {
-              case shufDep: ShuffleDependency[_, _, _] =>
-                val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
-                // Mark mapStage as available with shuffle outputs only after shuffle merge is
-                // finalized with push based shuffle. If not, subsequent ShuffleMapStage won't
-                // read from merged output as the MergeStatuses are not available.
-                if (!mapStage.isAvailable || !mapStage.shuffleDep.shuffleMergeFinalized) {
-                  missing += mapStage
-                } else {
-                  // Forward the nextAttemptId if skipped and get visited for the first time.
-                  // Otherwise, once it gets retried,
-                  // 1) the stuffs in stage info become distorting, e.g. task num, input byte, e.t.c
-                  // 2) the first attempt starts from 0-idx, it will not be marked as a retry
-                  mapStage.increaseAttemptIdOnFirstSkip()
-                }
-              case narrowDep: NarrowDependency[_] =>
-                waitingForVisit.prepend(narrowDep.rdd)
-            }
+    traverseRDDGraph(stage.rdd) { (rdd, enqueue) =>
+      val rddHasUncachedPartitions = try {
+        getCacheLocs(rdd).contains(Nil)
+      } catch {
+        case e: RpcTimeoutException =>
+          logWarning(log"Failed to get cache locations for RDD ${MDC(RDD_ID, rdd.id)} due " +
+            log"to rpc timeout, assuming not fully cached.", e)
+          true
+      }
+      if (rddHasUncachedPartitions) {
+        for (dep <- rdd.dependencies) {
+          dep match {
+            case shufDep: ShuffleDependency[_, _, _] =>
+              val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
+              // Mark mapStage as available with shuffle outputs only after shuffle merge is
+              // finalized with push based shuffle. If not, subsequent ShuffleMapStage won't
+              // read from merged output as the MergeStatuses are not available.
+              if (!mapStage.isAvailable || !mapStage.shuffleDep.shuffleMergeFinalized) {
+                missing += mapStage
+              } else {
+                // Forward the nextAttemptId if skipped and visited for the first time.
+                // Otherwise, once it gets retried:
+                // 1) the stage info fields become skewed, e.g. task count, input bytes, etc.
+                // 2) the first attempt starts from 0-idx, it will not be marked as a retry
+                mapStage.increaseAttemptIdOnFirstSkip()
+              }
+            case narrowDep: NarrowDependency[_] =>
+              enqueue(narrowDep.rdd)
           }
         }
       }
     }
-    while (waitingForVisit.nonEmpty) {
-      visit(waitingForVisit.remove(0))
-    }
     missing.toList
+  }
+
+  /**
+   * Whether the RDD graph rooted at `finalRDD` contains a [[PipelinedShuffleDependency]] anywhere.
+   * Walks the RDD dependency graph directly (not the stage graph), so it can be checked before any
+   * stages are created -- letting a job be rejected up front without leaving partial scheduler
+   * state behind.
+   */
+  private def rddGraphHasPipelinedDependency(finalRDD: RDD[_]): Boolean = {
+    // traverseRDDGraphUntil stops and returns false as soon as the visitor returns false; we use
+    // that to short-circuit on the first pipelined dependency found. It returns true if the whole
+    // graph was visited without stopping (i.e. none found), so negate the result.
+    !traverseRDDGraphUntil(finalRDD) { (rdd, enqueue) =>
+      val hasPipelined = rdd.dependencies.exists {
+        case _: PipelinedShuffleDependency[_, _, _] => true
+        case dep =>
+          enqueue(dep.rdd)
+          false
+      }
+      !hasPipelined // keep traversing while none found; stop (return false) when one is found
+    }
+  }
+
+  /**
+   * Classifies the shuffle boundaries in the RDD graph rooted at `finalRDD` by kind, walking the
+   * RDD dependency graph directly (before any stages are created). Returns whether the graph
+   * contains any [[PipelinedShuffleDependency]] and whether it contains any regular (non-pipelined)
+   * `ShuffleDependency`. Narrow dependencies are not boundaries and are ignored.
+   *
+   * A job must be either ALL-regular or ALL-pipelined: a job whose shuffle graph mixes a pipelined
+   * shuffle with a regular one is rejected fail-fast (see `handleJobSubmitted`). Restricting to a
+   * single kind makes the whole job one pipelined group when pipelined, so gang admission can be
+   * decided up front before any stage is submitted.
+   */
+  private def classifyJobShuffleKinds(finalRDD: RDD[_]): (Boolean, Boolean) = {
+    var hasPipelined = false
+    var hasRegular = false
+    traverseRDDGraph(finalRDD) { (rdd, enqueue) =>
+      rdd.dependencies.foreach { dep =>
+        dep match {
+          case _: PipelinedShuffleDependency[_, _, _] => hasPipelined = true
+          case _: ShuffleDependency[_, _, _] => hasRegular = true
+          case _ => // narrow dependency: not a boundary
+        }
+        // Descend through every edge (shuffle and narrow) so a pipelined boundary behind a regular
+        // one -- or vice versa -- anywhere in the graph is still detected. traverseRDDGraph dedups.
+        enqueue(dep.rdd)
+      }
+    }
+    (hasPipelined, hasRegular)
+  }
+
+  /**
+   * Reject a job that uses a pipelined shuffle in combination with a cluster feature that a
+   * pipelined group cannot support. Checked up front, before any stage is created, so a rejection
+   * leaves no partial scheduler state. Used by the result-job path (handleJobSubmitted); the
+   * map-stage-job path rejects a pipelined dependency outright (see handleMapStageSubmitted), which
+   * subsumes these. Returns true (and fails the job via `listener`) if rejected; false otherwise.
+   * The RDD-graph walk runs only when a relevant feature is enabled and is inert for jobs without a
+   * pipelined dependency.
+   *
+   * Rejected combinations:
+   *  - Speculation: a speculative copy of a producer would race a consumer already reading the
+   *    producer's partial output, with no commit barrier protecting the read.
+   *  - Dynamic allocation: a pipelined group is gang-scheduled (all member stages must run at
+   *    once), and the free-slot admission check measures currently-active executors. Under dynamic
+   *    allocation a job can start before any executor has spun up, so the group would be failed
+   *    with CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT against a transient 0-slot snapshot even though
+   *    the cluster would soon have capacity. Barrier scheduling forbids the same combination
+   *    (checkBarrierStageWithDynamicAllocation); pipelined groups do likewise.
+   */
+  private def rejectUnsupportedPipelinedJob(
+      jobId: Int,
+      finalRDD: RDD[_],
+      listener: JobListener): Boolean = {
+    // Only walk the RDD graph if a relevant feature is on, then only once.
+    val speculationOn = sc.conf.get(config.SPECULATION_ENABLED)
+    val dynAllocOn = Utils.isDynamicAllocationEnabled(sc.conf)
+    if ((speculationOn || dynAllocOn) && rddGraphHasPipelinedDependency(finalRDD)) {
+      if (speculationOn) {
+        logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: speculation is incompatible with " +
+          log"pipelined shuffle dependencies")
+        listener.jobFailed(new SparkException(
+          "Speculative execution is not supported for a job that uses a pipelined shuffle " +
+            s"dependency. Disable ${config.SPECULATION_ENABLED.key} for such jobs."))
+        return true
+      }
+      // dynAllocOn
+      logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: dynamic allocation is incompatible " +
+        log"with pipelined shuffle dependencies")
+      listener.jobFailed(new SparkException(
+        "Dynamic allocation is not supported for a job that uses a pipelined shuffle dependency: " +
+          "a pipelined stage group must be co-scheduled against a known cluster size. Disable " +
+          s"${config.DYN_ALLOCATION_ENABLED.key} for such jobs."))
+      return true
+    }
+    false
   }
 
   /** Invoke `.partitions` on the given RDD and all of its ancestors  */
   private def eagerlyComputePartitionsForRddAndAncestors(rdd: RDD[_]): Unit = {
     val startTime = System.nanoTime
-    val visitedRdds = new HashSet[RDD[_]]
-    // We are manually maintaining a stack here to prevent StackOverflowError
-    // caused by recursively visiting
-    val waitingForVisit = new ListBuffer[RDD[_]]
-    waitingForVisit += rdd
-
-    def visit(rdd: RDD[_]): Unit = {
-      if (!visitedRdds(rdd)) {
-        visitedRdds += rdd
-
-        // Eagerly compute:
-        rdd.partitions
-
-        for (dep <- rdd.dependencies) {
-          waitingForVisit.prepend(dep.rdd)
-        }
+    traverseRDDGraph(rdd) { (toVisit, enqueue) =>
+      // Eagerly compute:
+      toVisit.partitions
+      for (dep <- toVisit.dependencies) {
+        enqueue(dep.rdd)
       }
-    }
-
-    while (waitingForVisit.nonEmpty) {
-      visit(waitingForVisit.remove(0))
     }
     logDebug("eagerlyComputePartitionsForRddAndAncestors for RDD %d took %f seconds"
       .format(rdd.id, (System.nanoTime - startTime) / 1e9))
@@ -896,6 +1131,23 @@ private[spark] class DAGScheduler(
                   logDebug("Removing stage %d from failed set.".format(stageId))
                   failedStages -= stage
                 }
+                // Drop any pipelined-completion deferral keyed on this stage (as consumer), and
+                // remove it from other consumers' pending-producer sets (as producer), so no
+                // deferral outlives its job (e.g. on job abort before the producers finished).
+                // A consumer's buffered completion events hold TaskEnds that have not been emitted
+                // yet (the whole event is deferred until group completion). This teardown is a job
+                // failure / cancellation, so the buffered successes must NOT be applied as results
+                // -- but their TaskEnds must still be flushed, exactly as the producer-failed drop
+                // path does (see releaseDeferredPipelinedConsumers), or a listener tracking active
+                // tasks (e.g. AppStatusListener) would leak these tasks as perpetually running.
+                // Normally releaseDeferredPipelinedConsumers has already drained the deferral by
+                // the time cleanup runs (cancelRunningIndependentStages finishes each running
+                // producer first); this covers the case where it has not -- e.g. a producer left in
+                // resubmit limbo (finished but not available) that cancelRunningIndependentStages
+                // skips because it is neither running nor failed.
+                dependentStageMap.remove(stage).foreach(_.delayedTaskCompletionEvents.foreach(
+                  postTaskEnd))
+                dependentStageMap.values.foreach(_.parents -= stage)
               }
               // data structures based on StageId
               stageIdToStage -= stageId
@@ -1145,12 +1397,26 @@ private[spark] class DAGScheduler(
     eventProcessLoop.post(AllJobsCancelled)
   }
 
+  /**
+   * Cleanup the jobs of query execution tracked in the DAGScheduler.
+   */
+  def cleanupQueryJobs(executionId: Long): Unit = {
+    logInfo(s"Asked to cleanup jobs for query execution $executionId")
+    eventProcessLoop.post(CleanupQueryJobs(executionId))
+  }
+
   private[scheduler] def doCancelAllJobs(): Unit = {
     // Cancel all running jobs.
     runningStages.map(_.firstJobId).foreach(handleJobCancellation(_,
       Option("as part of cancellation of all jobs")))
     activeJobs.clear() // These should already be empty by this point,
     jobIdToActiveJob.clear() // but just in case we lost track of some jobs...
+  }
+
+  private[spark] def doCleanupQueryJobs(executionId: Long): Unit = {
+    Option(activeQueryToJobs.remove(executionId)).foreach { jobs =>
+      jobs.forEach(job => jobIdToQueryExecutionId.remove(job.jobId))
+    }
   }
 
   /**
@@ -1209,6 +1475,227 @@ private[spark] class DAGScheduler(
     waitingStages --= childStages
     for (stage <- childStages.sortBy(_.firstJobId)) {
       submitStage(stage)
+    }
+  }
+
+  /**
+   * Reconsider waiting stages that read `runningParent` through a pipelined edge, now that it has
+   * started running. A pipelined edge is non-sequencing, so such a consumer can be co-scheduled as
+   * soon as its producer is running -- it need not wait for the producer to finish. This is the
+   * "producer started" analog of `submitWaitingChildStages` (which fires on producer *completion*):
+   * without it, a pipelined consumer parked because its producer was not yet runnable (e.g. the
+   * producer sat behind a regular shuffle) would not be co-scheduled until the producer finished,
+   * losing the pipelining. Inert unless `runningParent` is the pipelined producer of a waiting
+   * stage.
+   */
+  private def submitWaitingPipelinedChildStages(runningParent: Stage): Unit = {
+    val pipelinedChildren = waitingStages.filter { child =>
+      child.parents.contains(runningParent) && isPipelinedProducer(runningParent)
+    }.toArray
+    // Remove them from waitingStages before resubmitting, or submitStage's `!waitingStages(stage)`
+    // guard would treat them as already-scheduled and no-op (mirrors submitWaitingChildStages).
+    waitingStages --= pipelinedChildren
+    for (child <- pipelinedChildren.sortBy(_.firstJobId)) {
+      logInfo(log"Reconsidering ${MDC(STAGE, child)} now that its pipelined producer " +
+        log"${MDC(STAGE, runningParent)} is running")
+      submitStage(child)
+    }
+  }
+
+  /**
+   * Whether `stage` produces its output through a [[PipelinedShuffleDependency]] -- i.e. it is a
+   * pipelined producer, whose consumers may run concurrently with it. Callers that need the
+   * producer/consumer relationship check `child.parents.contains(stage)` separately.
+   */
+  private def isPipelinedProducer(stage: Stage): Boolean = stage match {
+    case m: ShuffleMapStage => m.shuffleDep.isInstanceOf[PipelinedShuffleDependency[_, _, _]]
+    case _ => false
+  }
+
+  /**
+   * The total concurrent-task demand of an all-pipelined job, computed from the RDD graph BEFORE
+   * any stage is created (so a rejection based on it leaves no partial scheduler state, exactly as
+   * the barrier slot check and the speculation/DA reject do). Because a job is either all-regular
+   * or all-pipelined, an all-pipelined job's whole stage graph is one pipelined group; its members
+   * are the final result stage plus every pipelined producer. Each member's task count is its RDD's
+   * partition count (`rdd.partitions.length`), matching how `createShuffleMapStage` derives
+   * `numTasks`. `finalNumPartitions` is the result stage's task count (the number of partitions the
+   * job runs, which may be a subset of `finalRDD.partitions`).
+   *
+   * Count each producer once per SHUFFLE ID, matching what execution schedules: one stage is
+   * created per shuffle ID (`getOrCreateShuffleMapStage`), not per dependency edge. A fan-out or
+   * diamond graph references one `PipelinedShuffleDependency` from more than one consumer RDD, so
+   * charging its producer per edge would over-count and could reject a group whose stages actually
+   * fit. Dedup on `shuffleId`, not `pd.rdd`: two distinct dependencies can share a producer RDD yet
+   * carry distinct shuffle IDs and produce distinct stages, and both must be counted.
+   */
+  private def pipelinedJobConcurrentTaskDemand(finalRDD: RDD[_], finalNumPartitions: Int): Int = {
+    var demand = finalNumPartitions
+    val countedShuffleIds = new HashSet[Int]
+    traverseRDDGraph(finalRDD) { (rdd, enqueue) =>
+      rdd.dependencies.foreach {
+        case pd: PipelinedShuffleDependency[_, _, _] =>
+          if (countedShuffleIds.add(pd.shuffleId)) {
+            demand += pd.rdd.partitions.length
+          }
+        case _ => // regular/narrow deps do not occur in an all-pipelined job's group
+      }
+      rdd.dependencies.foreach(dep => enqueue(dep.rdd))
+    }
+    demand
+  }
+
+  /**
+   * Up-front gang admission for an all-pipelined job, checked BEFORE any stage exists. Because a
+   * job is either all-regular or all-pipelined (mixed jobs are already rejected), an all-pipelined
+   * job's whole stage graph is one pipelined group with no regular prefix, so its full demand is
+   * known up front and the group is ready to admit immediately. Checking here (rather than in
+   * `submitStage` once a producer is already running) is true all-or-nothing gang admission: the
+   * whole group is admitted, or the job is failed before any member runs, so a member is never left
+   * running while a sibling cannot get slots -- and, like the barrier slot check, a rejection
+   * leaves no partial scheduler state.
+   *
+   * Free-slot accounting: demand vs. total capacity (`maxNumConcurrentTasks` for the default
+   * profile -- a group is required to be single-profile) minus what OTHER work (other jobs) has
+   * outstanding -- running plus enqueued -- in that profile. Counting enqueued, not just running,
+   * tasks charges a busy neighbor's queued backlog against capacity too, so a group is not admitted
+   * against slots other work is already committed to. Fails the job via `listener` with no retry --
+   * a transient shortfall is the caller's to retry (e.g. the streaming batch loop reruns it).
+   * Returns true (job failed) if it does not fit.
+   *
+   * The likeness to barrier's slot check is only that both reject before any stage is created
+   * (leaving no partial state) and compute demand from the RDD graph. Retry behavior differs
+   * deliberately: barrier RE-POSTS the job and re-runs its check on a timer up to
+   * `spark.scheduler.barrier.maxConcurrentTasksCheck.maxFailures` times; pipelined admission is
+   * TERMINAL (one check, then fail), delegating transient-shortfall retry to the caller.
+   *
+   * The check can be turned off with `spark.scheduler.pipelinedGroup.slotCheck.enabled=false` (for
+   * deployments that admit capacity out-of-band, e.g. via a slot reservation).
+   */
+  private def rejectUnadmittablePipelinedGroup(
+      jobId: Int, finalRDD: RDD[_], partitions: Array[Int], listener: JobListener): Boolean = {
+    // Reject up-front (before any stage is created) two group members the admission model cannot
+    // support, walking the group's RDD graph once:
+    //  - A barrier member. A barrier stage exposes its output only after a global sync, which
+    //    contradicts a pipelined consumer reading the producer's output incrementally as it runs;
+    //    and its failure recovery resubmits the stage, which the group's atomic completion cannot
+    //    accommodate (a resubmitted producer would drop a co-scheduled consumer's buffered
+    //    completions). Reject it here rather than let it be co-scheduled.
+    //  - A member on a non-default resource profile. Admission below measures capacity and
+    //    occupancy against the default profile, but each stage derives its profile from its RDDs
+    //    (see createShuffleMapStage/createResultStage). A member carrying a non-default profile would be
+    //    admitted against the default profile's free slots yet run in a different, often smaller
+    //    pool -- and could then queue or deadlock there.
+    var offendingBarrier = false
+    var offendingRp: Option[ResourceProfile] = None
+    traverseRDDGraph(finalRDD) { (rdd, enqueue) =>
+      if (rdd.isBarrier()) {
+        offendingBarrier = true
+      }
+      val rp = rdd.getResourceProfile()
+      if (offendingRp.isEmpty && rp != null && rp.id != DEFAULT_RESOURCE_PROFILE_ID) {
+        offendingRp = Some(rp)
+      }
+      rdd.dependencies.foreach(dep => enqueue(dep.rdd))
+    }
+    if (offendingBarrier) {
+      logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: a pipelined stage group contains a " +
+        log"barrier member")
+      listener.jobFailed(new SparkException(
+        "A pipelined shuffle job with a barrier stage in the pipelined group is not supported: a " +
+          "barrier stage exposes its output only after a global sync, which is incompatible with " +
+          "a pipelined consumer reading its output incrementally."))
+      return true
+    }
+    if (offendingRp.nonEmpty) {
+      logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: a pipelined stage group member uses a " +
+        log"non-default resource profile")
+      listener.jobFailed(new SparkException(
+        "A pipelined shuffle job with a member on a non-default resource profile is not " +
+          s"supported (resource profile id ${offendingRp.get.id}): the whole pipelined stage " +
+          "group must run on the default resource profile."))
+      return true
+    }
+    if (!sc.conf.get(config.PIPELINED_GROUP_SLOT_CHECK_ENABLED)) {
+      return false
+    }
+    val rp = sc.resourceProfileManager.defaultResourceProfile
+    val demand = pipelinedJobConcurrentTaskDemand(finalRDD, partitions.length)
+    val totalSlots = maxConcurrentTasksForProfile(rp.id)
+    // No stage of this job exists yet, so it has no outstanding tasks of its own to exclude; only
+    // other concurrent jobs' outstanding demand is charged, resource-profile-scoped.
+    val outstandingForOthers = outstandingTasksForOtherWork(rp.id, Set.empty)
+    val freeSlots = math.max(0, totalSlots - outstandingForOthers)
+    if (demand > freeSlots) {
+      logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: pipelined stage group needs " +
+        log"${MDC(NUM_TASKS, demand)} concurrent task slots but only " +
+        log"${MDC(NUM_SLOTS, freeSlots)} are free")
+      listener.jobFailed(new SparkException(
+        errorClass = "CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT",
+        messageParameters = scala.collection.immutable.Map(
+          "numTasks" -> demand.toString, "numSlots" -> freeSlots.toString),
+        cause = null))
+      true
+    } else {
+      false
+    }
+  }
+
+  /**
+   * The cluster's total concurrent-task capacity for the given resource profile. Extracted as a
+   * seam so tests can control it without changing the cluster's core count. Production reads it
+   * from the scheduler backend, exactly as barrier's slot check does.
+   */
+  protected def maxConcurrentTasksForProfile(rpId: Int): Int = {
+    val rp = sc.resourceProfileManager.resourceProfileFromId(rpId)
+    sc.maxNumConcurrentTasks(rp)
+  }
+
+  /**
+   * Outstanding tasks (running plus enqueued) in the given resource profile, for work OTHER than
+   * the stages in `excludeStageIds`. Counting enqueued tasks, not just running ones, means a busy
+   * neighbor's queued backlog is charged against capacity too, so a group is not admitted against
+   * slots that other work is already committed to using. Resource-profile-scoped to match
+   * `maxConcurrentTasksForProfile`. Extracted as a seam so tests can control occupancy without
+   * launching real tasks; returns 0 for a non-TaskSchedulerImpl backend.
+   */
+  protected def outstandingTasksForOtherWork(rpId: Int, excludeStageIds: Set[Int]): Int =
+    taskScheduler match {
+      case impl: TaskSchedulerImpl =>
+        impl.outstandingTasksForOtherWorkInProfile(rpId, excludeStageIds)
+      case _ => 0
+    }
+
+  /**
+   * Whether `stage` is a member of a pipelined group -- i.e. it is connected to another stage by a
+   * [[PipelinedShuffleDependency]], either as the producer (it writes such a shuffle) or as a
+   * consumer (one of its direct parent shuffle dependencies is pipelined). Members run
+   * concurrently over a transient shuffle that cannot be re-read in isolation, so a member's task
+   * failure must fail the whole group rather than resubmit one stage; the task scheduler keys its
+   * fail-fast behavior off this (via TaskSet.isPipelined). False for any stage in a job with no
+   * pipelined dependency.
+   *
+   * NOTE: this is deliberately defined here alongside the other group-topology helper
+   * (`isPipelinedProducer`). Its call sites are the group-atomic failure handling: tagging the
+   * member's `TaskSet.isPipelined` at submission and routing a member FetchFailed to a whole-group
+   * abort.
+   */
+  private def isPipelinedGroupMember(stage: Stage): Boolean = {
+    if (isPipelinedProducer(stage)) {
+      return true
+    }
+    // Consumer check: does this stage read through a PipelinedShuffleDependency at one of its
+    // shuffle boundaries? Walk the stage's own RDD graph (descending narrow deps, stopping at every
+    // shuffle boundary) -- the same edges that define the stage -- and look for a pipelined one.
+    !traverseRDDGraphUntil(stage.rdd) { (rdd, enqueue) =>
+      val hasPipelinedBoundary = rdd.dependencies.exists {
+        case _: PipelinedShuffleDependency[_, _, _] => true
+        case _: ShuffleDependency[_, _, _] => false // regular shuffle boundary: do not descend
+        case narrowDep =>
+          enqueue(narrowDep.rdd)
+          false
+      }
+      !hasPipelinedBoundary // keep walking until a pipelined boundary is found
     }
   }
 
@@ -1325,6 +1812,18 @@ private[spark] class DAGScheduler(
     listenerBus.post(SparkListenerTaskGettingResult(taskInfo))
   }
 
+  private def getQueryExecutionIdFromProperties(properties: Properties): Option[Long] = {
+    try {
+      Option(properties)
+        .flatMap(properties => Option(properties.getProperty(SparkContext.SQL_EXECUTION_ID_KEY)))
+        .map(_.toLong)
+    } catch {
+      case e: Throwable =>
+        logWarning(log"Failed to get query execution ID from job properties", e)
+        None
+    }
+  }
+
   private[scheduler] def handleJobSubmitted(
       jobId: Int,
       finalRDD: RDD[_],
@@ -1340,6 +1839,40 @@ private[spark] class DAGScheduler(
       listener.jobFailed(
         SparkCoreErrors.sparkJobCancelledAsPartOfJobGroupError(jobId, jobGroupIdOpt.get))
       logInfo(log"Skip running a job that belongs to the cancelled job group ${MDC(GROUP_ID, jobGroupIdOpt.get)}")
+      return
+    }
+
+    // A job that uses a pipelined shuffle co-schedules its producer and consumer stages, which is
+    // incompatible with speculation (a speculative producer copy would race a consumer reading its
+    // partial output) and with dynamic allocation (the gang-scheduling slot check would fail
+    // against a not-yet-warmed cluster). Reject such a job up front -- before any stages are
+    // created, so no partial scheduler state is left behind. (Inert for jobs without any pipelined
+    // dependency.)
+    if (rejectUnsupportedPipelinedJob(jobId, finalRDD, listener)) {
+      return
+    }
+
+    // A job must be either ALL-regular or ALL-pipelined, not a mix: a job whose shuffle graph
+    // combines a pipelined shuffle with a regular one is rejected up front (before any stage is
+    // created). Restricting to a single kind makes an all-pipelined job's whole stage graph one
+    // pipelined group with no regular prefix, so gang admission is decided up front (see the slot
+    // check below) rather than mid-DAG once a producer is already running.
+    val (hasPipelined, hasRegular) = classifyJobShuffleKinds(finalRDD)
+    if (hasPipelined && hasRegular) {
+      logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: a job mixing a pipelined shuffle with " +
+        log"a regular shuffle is not supported")
+      listener.jobFailed(new SparkException(
+        "A job that mixes a pipelined shuffle dependency with a regular shuffle dependency is " +
+          "not supported: a job must be either all-regular or all-pipelined."))
+      return
+    }
+
+    // Gang admission for an all-pipelined job: the whole stage graph is one pipelined group, so
+    // check up front (before any stage is created) that the cluster can run the entire group
+    // concurrently. If it cannot fit, fail the job now -- no partial scheduler state, and no member
+    // ever left running while a sibling waits on slots (true all-or-nothing gang admission). Inert
+    // for a regular job (no pipelined dependency).
+    if (hasPipelined && rejectUnadmittablePipelinedGroup(jobId, finalRDD, partitions, listener)) {
       return
     }
 
@@ -1398,6 +1931,10 @@ private[spark] class DAGScheduler(
     val jobSubmissionTime = clock.getTimeMillis()
     jobIdToActiveJob(jobId) = job
     activeJobs += job
+    getQueryExecutionIdFromProperties(properties).foreach { qeId =>
+      activeQueryToJobs.computeIfAbsent(qeId, _ => ConcurrentHashMap.newKeySet()).add(job)
+      jobIdToQueryExecutionId.put(jobId, qeId)
+    }
     finalStage.setActiveJob(job)
     val stageIds = jobIdToStageIds(jobId).toArray
     val stageInfos =
@@ -1414,6 +1951,24 @@ private[spark] class DAGScheduler(
       listener: JobListener,
       artifacts: JobArtifactSet,
       properties: Properties): Unit = {
+    // A map-stage job (SparkContext.submitMapStage, e.g. AQE's ShuffleExchangeExec) materializes a
+    // shuffle to produce its map-output statistics. A PipelinedShuffleDependency cannot serve that:
+    // it is transient with no durable, addressable map output, so it registers no map outputs and
+    // getStatistics would return all-zero stats (misleading the map-stage/AQE consumer); and its
+    // producer/consumer co-scheduling makes speculation unsafe. Reject a pipelined
+    // dependency submitted as a map-stage job outright, up front, before any stage is created so no
+    // partial scheduler state is left behind. Inert for a regular ShuffleDependency. (The
+    // result-job path, handleJobSubmitted, rejects the speculation and dynamic-allocation cases via
+    // rejectUnsupportedPipelinedJob, but a pipelined dependency is otherwise a legitimate internal
+    // edge there.)
+    if (dependency.isInstanceOf[PipelinedShuffleDependency[_, _, _]]) {
+      logWarning(log"Rejecting map-stage job ${MDC(JOB_ID, jobId)}: a pipelined shuffle dependency " +
+        log"cannot be materialized as a map-stage job")
+      listener.jobFailed(new SparkException(
+        "A pipelined shuffle dependency cannot be submitted as a map-stage job: it has no durable " +
+          "map output to produce statistics from. This is not supported."))
+      return
+    }
     // Submitting this map stage might still require the creation of some parent stages, so make
     // sure that happens.
     var finalStage: ShuffleMapStage = null
@@ -1441,6 +1996,10 @@ private[spark] class DAGScheduler(
     val jobSubmissionTime = clock.getTimeMillis()
     jobIdToActiveJob(jobId) = job
     activeJobs += job
+    getQueryExecutionIdFromProperties(properties).foreach { qeId =>
+      activeQueryToJobs.computeIfAbsent(qeId, _ => ConcurrentHashMap.newKeySet()).add(job)
+      jobIdToQueryExecutionId.put(jobId, qeId)
+    }
     finalStage.addActiveJob(job)
     val stageIds = jobIdToStageIds(jobId).toArray
     val stageInfos =
@@ -1476,11 +2035,63 @@ private[spark] class DAGScheduler(
             logInfo(log"Submitting ${MDC(STAGE, stage)} (${MDC(RDD_ID, stage.rdd)}), " +
                     log"which has no missing parents")
             submitMissingTasks(stage, jobId.get)
+            // If this stage is the pipelined producer of a waiting consumer, co-schedule it now.
+            submitWaitingPipelinedChildStages(stage)
           } else {
             for (parent <- missing) {
               submitStage(parent)
             }
-            waitingStages += stage
+
+            // Submitting a parent can abort the job during this recursion (e.g. a parent that has
+            // exhausted its stage attempts hits abortStage, which cleans up all of the job's stages
+            // including this one and fails the job). If that happened, `stage` is no longer
+            // registered; do not proceed to co-schedule or re-park it (re-parking would re-insert a
+            // job-less stage into waitingStages -- a scheduler-state leak). Inert for a
+            // non-aborting submit. (Pipelined group admission is decided up front in
+            // handleJobSubmitted, so it cannot abort the group from within this recursion.)
+            if (!stageIdToStage.contains(stage.id)) {
+              logInfo(log"${MDC(STAGE, stage)} was removed during parent submission (its job was " +
+                log"aborted); not co-scheduling or re-parking it")
+              return
+            }
+
+            // A missing parent reached through a PipelinedShuffleDependency ("pipelined parent")
+            // is incrementally readable: this stage may run before that parent materializes, so
+            // the two are co-scheduled. `missing` already holds the direct parent shuffle-map
+            // stages (from getMissingParentStages), so classify them by their shuffle dependency
+            // type -- no extra graph walk. For a job with no pipelined dependency, pipelinedMissing
+            // is empty and this stage simply parks in waitingStages, exactly as before.
+            val (pipelinedMissing, regularMissing) = missing.partition(isPipelinedProducer)
+            // Co-schedule only if EVERY missing parent is pipelined AND each is actually running
+            // now. submitStage above may have parked a pipelined parent in waitingStages (e.g. it
+            // has its own regular missing parent); running this stage against a not-yet-running
+            // producer would strand it. If any parent is regular or not yet runnable, park this
+            // stage. It is then resubmitted and co-scheduled once its parents become runnable --
+            // via submitWaitingChildStages when a regular parent completes, or via
+            // submitWaitingPipelinedChildStages when a pipelined parent starts running.
+            val allPipelinedParentsRunning =
+              pipelinedMissing.nonEmpty && pipelinedMissing.forall(runningStages.contains)
+
+            if (regularMissing.isEmpty && allPipelinedParentsRunning) {
+              // The whole group's capacity was already admitted up front (handleJobSubmitted ->
+              // rejectUnadmittablePipelinedGroup) before any member was submitted, so the group is
+              // known to fit; just co-schedule this consumer with its running producer(s). No slot
+              // check here -- that would re-measure capacity against a mid-flight snapshot and is
+              // unnecessary once admission is decided up front (gang admission).
+              logInfo(log"Submitting ${MDC(STAGE, stage)} concurrently with its running " +
+                log"pipelined producer(s) ${MDC(MISSING_PARENT_STAGES, pipelinedMissing)}")
+              // Record that this stage is co-scheduled with still-running pipelined producers,
+              // so its successful completions are deferred until those producers finish.
+              val deferral =
+                dependentStageMap.getOrElseUpdate(stage, DependentStageInfo())
+              deferral.parents ++= pipelinedMissing
+              submitMissingTasks(stage, jobId.get)
+              // This stage is now running; if it is itself the pipelined producer of a waiting
+              // consumer, co-schedule that consumer too.
+              submitWaitingPipelinedChildStages(stage)
+            } else {
+              waitingStages += stage
+            }
           }
         }
       }
@@ -1495,7 +2106,14 @@ private[spark] class DAGScheduler(
    */
   private def addPySparkConfigsToProperties(stage: Stage, properties: Properties): Unit = {
     val rp = sc.resourceProfileManager.resourceProfileFromId(stage.resourceProfileId)
+    // A profile that does not override pyspark memory runs its tasks on executors that were
+    // provisioned with the default profile's allocation: a task-only profile declares no
+    // executor resources at all, and getResourcesForClusterManager starts a full profile's
+    // executor request from the default allocation, overriding only what the profile
+    // specifies. Inherit the default value so the worker memory limit matches what the
+    // executor was sized with. An explicit pysparkMemory(0) still disables the limit.
     val pysparkMem = rp.getPySparkMemory
+      .orElse(sc.resourceProfileManager.defaultResourceProfile.getPySparkMemory)
     // use the getOption on EXECUTOR_CORES.key instead of using the EXECUTOR_CORES config reader
     // because the default for this config isn't correct for standalone mode. Here we want
     // to know if it was explicitly set or not. The default profile always has it set to either
@@ -1508,6 +2126,56 @@ private[spark] class DAGScheduler(
     }
     pysparkMem.map(mem => properties.setProperty(PYSPARK_MEMORY_LOCAL_PROPERTY, mem.toString))
     execCores.map(cores => properties.setProperty(EXECUTOR_CORES_LOCAL_PROPERTY, cores))
+    // Pass the executor's max concurrent tasks so PySpark splits worker memory by real
+    // concurrency rather than cpu slots alone. Which bound is safe depends on who can share
+    // the executor:
+    // - With dynamic allocation off, default-profile and task-only-profile tasks can run on
+    //   one executor concurrently. A custom-resource limit (e.g. a single gpu) bounds only its
+    //   own profile's tasks, not the executor's total worker count, so only the
+    //   cpus-proportional cores split keeps the aggregate of all co-scheduled workers within
+    //   the executor-wide budget: with shares of budget / ceil(cores / taskCpus), each worker
+    //   holds at most budget * taskCpus / cores, and the co-scheduled task cpus sum to at
+    //   most the executor cores. (Ceiling division keeps this true even when task cpus do not
+    //   evenly divide the cores, at the cost of slightly sub-proportional shares there.)
+    // - Otherwise executors serve a single profile and the profile's own limiting resource
+    //   (across cores and custom resources) is the real concurrency. When the cores limit is
+    //   unknown (standalone without an explicit spark.executor.cores, SPARK-30299), a
+    //   custom-resource limit is still a valid upper bound on concurrency, capped by the cores
+    //   bound derived from the profile's explicit executor cores when available: an uncapped
+    //   overestimate would shrink -- or zero out, tripping the unsatisfiable-share fail-fast --
+    //   every worker's memory share. Dividing by an upper bound under-allocates but never
+    //   overcommits.
+    // maxTasksPerExecutor() also populates isCoresLimitKnown.
+    val maxTasks = rp.maxTasksPerExecutor(sc.conf)
+    val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(rp, sc.conf)
+    val knownCores = if (rp.isCoresLimitKnown) {
+      Some(rp.getExecutorCores.getOrElse(sc.conf.get(config.EXECUTOR_CORES)))
+    } else {
+      rp.getExecutorCores
+    }
+    val limitedByCustomResource = {
+      val limiting = rp.limitingResource(sc.conf)
+      limiting.nonEmpty && limiting != CPUS
+    }
+    val sharedExecutor = !Utils.isDynamicAllocationEnabled(sc.conf) &&
+      (rp.id == DEFAULT_RESOURCE_PROFILE_ID || rp.isInstanceOf[TaskResourceProfile])
+    val maxTasksToPropagate = if (sharedExecutor) {
+      knownCores.map { c =>
+        ResourceProfile.numMemoryShareSlotsCeil(CpuAmount.normalize(BigDecimal(c)), taskCpus)
+      }
+    } else if (rp.isCoresLimitKnown) {
+      Some(maxTasks)
+    } else if (limitedByCustomResource) {
+      val coresBasedMaxTasks = knownCores.map { c =>
+        ResourceProfile.numTasksBasedOnCores(CpuAmount.normalize(BigDecimal(c)), taskCpus)
+      }
+      Some(coresBasedMaxTasks.fold(maxTasks)(math.min(maxTasks, _)))
+    } else {
+      None
+    }
+    maxTasksToPropagate.foreach { n =>
+      properties.setProperty(MAX_TASKS_PER_EXECUTOR_LOCAL_PROPERTY, n.toString)
+    }
   }
 
   /**
@@ -1538,6 +2206,128 @@ private[spark] class DAGScheduler(
     }
   }
 
+  /**
+   * Returns true when this just-completed shuffle map task should have its output corrupted by
+   * the test-only fetch-failure injection. We corrupt only the partition-0 task, and only on
+   * the stage attempt that first successfully completes partition 0 - latched into
+   * injectShuffleFetchFailuresCorruptedAttempt. Recomputes (later attempts) of that partition
+   * are left clean so the consumer can make progress on its retry. The latch is per-shuffle,
+   * so non-leaf stages whose earlier attempts failed on fetch from upstream are still
+   * corrupted on their first successful attempt.
+   */
+  private def shouldCorruptShuffleOutputForTest(shuffleId: Int, task: Task[_]): Boolean = {
+    if (task.partitionId != 0) return false
+    ensureInjectShuffleFetchFailuresCleanerListenerForTest()
+    val recorded = injectShuffleFetchFailuresCorruptedAttempt.computeIfAbsent(
+      shuffleId, _ => task.stageAttemptId)
+    recorded == task.stageAttemptId
+  }
+
+  /**
+   * Apply the test-only fetch-failure injection to this just-completed map task: with
+   * DOWNSTREAM_DELAY > 0 record the (mapId, original location) so
+   * maybeApplyDelayedCorruptionForTest can corrupt it later, otherwise update the MapStatus
+   * location to an invalid block manager id inline.
+   */
+  private def corruptShuffleOutputForTest(shuffleId: Int, status: MapStatus): Unit = {
+    val downstreamDelay =
+      sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES_DOWNSTREAM_DELAY)
+    if (downstreamDelay > 0) {
+      injectShuffleFetchFailuresPendingDelayedCorruption.put(
+        shuffleId, (status.mapId, status.location))
+    } else {
+      status.updateLocation(injectShuffleFetchFailuresInvalidBlockManagerId(status.location))
+    }
+  }
+
+  /**
+   * For INJECT_SHUFFLE_FORCE_CHECKSUM_MISMATCH_ON_RECOMPUTE: returns true when this shuffle map
+   * task is the recompute of a partition whose previous successful attempt was the one corrupted
+   * by INJECT_SHUFFLE_FETCH_FAILURES. Forcing the mismatch on the recompute drives the rollback
+   * path - downstream ShuffleMapStages get cleaned up and re-run fully, downstream ResultStages
+   * are aborted.
+   */
+  private def isForcedChecksumMismatchForTest(shuffleId: Int, task: Task[_]): Boolean = {
+    if (!sc.conf.get(config.Tests.INJECT_SHUFFLE_FORCE_CHECKSUM_MISMATCH_ON_RECOMPUTE)) return false
+    if (task.partitionId != 0) return false
+    val recorded =
+      injectShuffleFetchFailuresCorruptedAttempt.getOrDefault(shuffleId, -1)
+    recorded >= 0 && recorded != task.stageAttemptId
+  }
+
+  /**
+   * Apply the deferred mapper-0 corruption (configured via
+   * INJECT_SHUFFLE_FETCH_FAILURES_DOWNSTREAM_DELAY for ShuffleMapStage consumers and
+   * INJECT_SHUFFLE_FETCH_FAILURES_RESULT_STAGE_DELAY for ResultStage consumers) when enough
+   * consumer tasks have succeeded. Walks the just-completed stage's direct shuffle parents,
+   * increments the per-shuffle consumer-success counter, and corrupts the registered MapStatus
+   * when the counter reaches the configured delay.
+   */
+  private def maybeApplyDelayedCorruptionForTest(stage: Stage): Unit = {
+    if (!sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES)) return
+    if (injectShuffleFetchFailuresPendingDelayedCorruption.isEmpty) return
+    val isResultStage = stage.isInstanceOf[ResultStage]
+    val delay = if (isResultStage) {
+      sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES_RESULT_STAGE_DELAY)
+    } else {
+      sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES_DOWNSTREAM_DELAY)
+    }
+    if (delay <= 0) return  // delay == 0 was already handled at submission time
+
+    val parentShuffleIds = stage.parents.collect {
+      case sms: ShuffleMapStage => sms.shuffleDep.shuffleId
+    }
+    parentShuffleIds.foreach { shuffleId =>
+      if (injectShuffleFetchFailuresPendingDelayedCorruption.containsKey(shuffleId)) {
+        val newCount = injectShuffleFetchFailuresDownstreamSuccessCount.merge(shuffleId, 1, _ + _)
+        if (newCount >= delay) {
+          val (mapId, originalLocation) =
+            injectShuffleFetchFailuresPendingDelayedCorruption.remove(shuffleId)
+          mapOutputTracker.updateMapOutput(
+            shuffleId, mapId, injectShuffleFetchFailuresInvalidBlockManagerId(originalLocation))
+          // Bump the epoch so any executor that already fetched this shuffle's statuses
+          // re-fetches them; updateMapOutput on its own only invalidates the driver-side
+          // serialized cache.
+          mapOutputTracker.incrementEpoch()
+          logInfo(s"Test injection: corrupted mapper-0 of shuffle $shuffleId after " +
+            s"$newCount downstream consumer successes")
+        }
+      }
+    }
+  }
+
+  /**
+   * For INJECT_SHUFFLE_FETCH_FAILURES_RESULT_STAGE_DELAY = 0: when a ResultStage is about to
+   * dispatch tasks, fire any pending mapper-0 corruption for its direct shuffle parents
+   * BEFORE result tasks start. This keeps the result stage at zero finished tasks when
+   * INJECT_SHUFFLE_FORCE_CHECKSUM_MISMATCH_ON_RECOMPUTE later triggers `rollbackSucceedingStages`,
+   * so the rollback path does not abort a partially-finished result stage.
+   */
+  private def maybePreemptiveCorruptionForResultStage(stage: Stage): Unit = {
+    if (!stage.isInstanceOf[ResultStage]) return
+    if (!sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES)) return
+    if (sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES_RESULT_STAGE_DELAY) > 0) return
+    if (injectShuffleFetchFailuresPendingDelayedCorruption.isEmpty) return
+
+    val parentShuffleIds = stage.parents.collect {
+      case sms: ShuffleMapStage => sms.shuffleDep.shuffleId
+    }
+    parentShuffleIds.foreach { shuffleId =>
+      if (injectShuffleFetchFailuresPendingDelayedCorruption.containsKey(shuffleId)) {
+        val (mapId, originalLocation) =
+          injectShuffleFetchFailuresPendingDelayedCorruption.remove(shuffleId)
+        mapOutputTracker.updateMapOutput(
+          shuffleId, mapId, injectShuffleFetchFailuresInvalidBlockManagerId(originalLocation))
+        // Bump the epoch so any executor that already fetched this shuffle's statuses
+        // re-fetches them; updateMapOutput on its own only invalidates the driver-side
+        // serialized cache.
+        mapOutputTracker.incrementEpoch()
+        logInfo(s"Test injection: corrupted mapper-0 of shuffle $shuffleId before result-stage " +
+          s"submission")
+      }
+    }
+  }
+
   private def configureShufflePushMergerLocations(stage: ShuffleMapStage): Unit = {
     if (stage.shuffleDep.getMergerLocs.nonEmpty) return
     val mergerLocs = sc.schedulerBackend.getShufflePushMergerLocations(
@@ -1555,34 +2345,32 @@ private[spark] class DAGScheduler(
   private def submitMissingTasks(stage: Stage, jobId: Int): Unit = {
     logDebug("submitMissingTasks(" + stage + ")")
 
-    // Before find missing partition, do the intermediate state clean work first.
-    // The operation here can make sure for the partially completed intermediate stage,
-    // `findMissingPartitions()` returns all partitions every time.
+    if (Utils.isTesting) {
+      maybePreemptiveCorruptionForResultStage(stage)
+    }
+
+    // For statically indeterminate stages being retried, we trigger rollback BEFORE task
+    // submission. This is more efficient than deferring to task completion because:
+    // 1. It avoids submitting a partial stage that would need to be cancelled
+    // 2. It ensures findMissingPartitions() returns ALL partitions for the retry
+    //
+    // For runtime detection (checksum mismatch), we must defer to task completion because
+    // we don't know the stage is indeterminate until we see the checksum differ.
     stage match {
       case sms: ShuffleMapStage if !sms.isAvailable =>
-        if (!sms.shuffleDep.checksumMismatchFullRetryEnabled && stage.isIndeterminate) {
-          // already executed at least once
-          if (sms.getNextAttemptId > 0) {
-            // While we previously validated possible rollbacks during the handling of a FetchFailure,
-            // where we were fetching from an indeterminate source map stages, this later check
-            // covers additional cases like recalculating an indeterminate stage after an executor
-            // loss. Moreover, because this check occurs later in the process, if a result stage task
-            // has successfully completed, we can detect this and abort the job, as rolling back a
-            // result stage is not possible.
-            val stagesToRollback = collectSucceedingStages(sms)
-            filterAndAbortUnrollbackableStages(stagesToRollback)
-            // stages which cannot be rolled back were aborted which leads to removing the
-            // the dependant job(s) from the active jobs set
-            val numActiveJobsWithStageAfterRollback =
-              activeJobs.count(job => stagesToRollback.contains(job.finalStage))
-            if (numActiveJobsWithStageAfterRollback == 0) {
-              logInfo(log"All jobs depending on the indeterminate stage " +
-                log"(${MDC(STAGE_ID, stage.id)}) were aborted so this stage is not needed anymore.")
-              return
-            }
+        if (sms.isStaticallyIndeterminate &&
+            !sms.shuffleDep.checksumMismatchFullRetryEnabled &&
+            sms.getNextAttemptId > 0) {
+          // The `rollbackCurrentStage = true` parameter ensures the current submitting stage
+          // is included in the cleanup for a fresh start: clearing its shuffle outputs, marking
+          // old task results to be ignored, and creating a new shuffle merge state for the
+          // upcoming retry.
+          rollbackSucceedingStages(sms, rollbackCurrentStage = true)
+          if (!stageIdToStage.contains(stage.id)) {
+            logInfo(log"All jobs depending on the indeterminate stage " +
+              log"(${MDC(STAGE_ID, stage.id)}) were aborted so this stage is not needed anymore.")
+            return
           }
-          mapOutputTracker.unregisterAllMapAndMergeOutput(sms.shuffleDep.shuffleId)
-          sms.shuffleDep.newShuffleMergeState()
         }
       case _ =>
     }
@@ -1591,8 +2379,14 @@ private[spark] class DAGScheduler(
     val partitionsToCompute: Seq[Int] = stage.findMissingPartitions()
 
     // Use the scheduling pool, job group, description, etc. from an ActiveJob associated
-    // with this Stage
-    val properties = jobIdToActiveJob(jobId).properties
+    // with this Stage. Clone it per stage so the profile-specific values written by
+    // addPySparkConfigsToProperties below don't leak -- through the shared, mutable job
+    // Properties instance passed to every task and TaskSet of the job -- into sibling stages
+    // of the same job that use a different resource profile. Job properties may be null when
+    // a job is submitted to the scheduler directly (e.g. in tests); materialize an empty map
+    // since the stage-local resource values are always written.
+    val properties = Option(Utils.cloneProperties(jobIdToActiveJob(jobId).properties))
+      .getOrElse(new Properties())
     addPySparkConfigsToProperties(stage, properties)
 
     runningStages += stage
@@ -1794,6 +2588,11 @@ private[spark] class DAGScheduler(
             throw SparkCoreErrors.accessNonExistentAccumulatorError(id)
         }
         acc.merge(updates.asInstanceOf[AccumulatorV2[Any, Any]])
+        if (acc.isInstanceOf[LastAttemptAccumulator[_, _, _]]) {
+          acc.asInstanceOf[LastAttemptAccumulator[_, _, _]].mergeLastAttempt(
+            updates, stage.rdd, event.taskInfo,
+            task.stageId, task.stageAttemptId, task.localProperties)
+        }
         // To avoid UI cruft, ignore cases where value wasn't updated
         if (acc.name.isDefined && !updates.isZero) {
           stage.latestInfo.accumulables(id) = acc.toInfo(None, Some(acc.value))
@@ -1880,7 +2679,9 @@ private[spark] class DAGScheduler(
         if (shuffleStage.isAvailable) {
           computedTotalSize
         } else {
-          if (shuffleStage.isIndeterminate) {
+          // For indeterminate stages, don't use partial merge results as the stage output
+          // may change on retry
+          if (shuffleStage.isStaticallyIndeterminate) {
             0L
           } else {
             computedTotalSize
@@ -1902,16 +2703,28 @@ private[spark] class DAGScheduler(
    * stages will be resubmitted and re-try all the tasks, as the input data may be changed after
    * the map tasks are re-tried. For stages where rollback and retry all tasks are not possible,
    * we will need to abort the stages.
+   *
+   * @return true if the corresponding active jobs are not aborted and will continue to run after rollback, otherwise false
    */
-  private[scheduler] def rollbackSucceedingStages(mapStage: ShuffleMapStage): Unit = {
-    val stagesToRollback = collectSucceedingStages(mapStage).filterNot(_ == mapStage)
+  private[scheduler] def rollbackSucceedingStages(
+      mapStage: ShuffleMapStage,
+      rollbackCurrentStage: Boolean = false): Boolean = {
+    val stagesToRollback = if (rollbackCurrentStage) {
+      collectSucceedingStages(mapStage)
+    } else {
+      collectSucceedingStages(mapStage).filterNot(_ == mapStage)
+    }
+    logInfo(log"Found succeeding stages ${MDC(STAGES, stagesToRollback)} of " +
+      log"shuffle checksum mismatch stage ${MDC(STAGE, mapStage)} in active jobs")
     val stagesCanRollback = filterAndAbortUnrollbackableStages(stagesToRollback)
+
     // stages which cannot be rolled back were aborted which leads to removing the
     // the dependant job(s) from the active jobs set, there could be no active jobs
     // left depending on the indeterminate stage and hence no need to roll back any stages.
     val numActiveJobsWithStageAfterRollback =
       activeJobs.count(job => stagesToRollback.contains(job.finalStage))
-    if (numActiveJobsWithStageAfterRollback == 0) {
+    val hasActiveJobs = numActiveJobsWithStageAfterRollback > 0
+    if (!hasActiveJobs) {
       logInfo(log"All jobs depending on the indeterminate stage " +
         log"(${MDC(STAGE_ID, mapStage.id)}) were aborted.")
     } else {
@@ -1920,9 +2733,15 @@ private[spark] class DAGScheduler(
       // Rollback the running stages first to avoid triggering more fetch failures.
       stagesToRollback.toSeq.sortBy(!runningStages.contains(_)).foreach {
         case sms: ShuffleMapStage =>
-          rollbackShuffleMapStage(sms, "rolling back due to indeterminate " +
-            s"output of shuffle map stage $mapStage")
-          sms.markAsRollingBack()
+          // Iterate over the stages to rollback and checking whether the stage has been rolled back
+          // for the current attempt to avoid rolling back the same stage attempt multiple times.
+          val alreadyRollingBack =
+            sms.maxAttemptIdToIgnore.contains(sms.latestInfo.attemptNumber())
+          if (sms.getNextAttemptId > 0 && !alreadyRollingBack) {
+            rollbackShuffleMapStage(sms, "rolling back due to indeterminate " +
+              s"output of shuffle map stage $mapStage")
+            sms.markAsRollingBack()
+          }
 
         case rs: ResultStage =>
           rs.markAsRollingBack()
@@ -1931,6 +2750,94 @@ private[spark] class DAGScheduler(
       logInfo(log"The shuffle map stage ${MDC(STAGE, mapStage)} with indeterminate output " +
         log"was retried, we will roll back and rerun its succeeding " +
         log"stages: ${MDC(STAGES, stagesCanRollback)}")
+    }
+    // Whether there are still active jobs which need to be processed
+    hasActiveJobs
+  }
+
+  private def getCompletedJobsFromSameQuery(mapStage: ShuffleMapStage): Array[ActiveJob] = {
+    import scala.jdk.CollectionConverters._
+    val executionIds = mapStage
+      .jobIds
+      .flatMap(jobId => Option(jobIdToQueryExecutionId.get(jobId)))
+    if (executionIds.size > 1) {
+      logWarning(log"There are multiple queries reuse the same stage: ${MDC(STAGE, mapStage)}")
+    }
+    executionIds
+      .flatMap(qeId => Option(activeQueryToJobs.get(qeId)).map(_.asScala).getOrElse(Set.empty))
+      .diff(activeJobs)
+      .toArray
+      .sortBy(_.jobId)
+  }
+
+  private def abortSucceedingFinalStages(mapStage: ShuffleMapStage, reason: String): Unit = {
+    val jobFinalStages = activeJobs.map(_.finalStage).toSet
+
+    collectSucceedingStages(mapStage)
+      .intersect(jobFinalStages)
+      .foreach { stage =>
+        // Abort stage will fail the jobs depending on it, cleaning up the stages for these jobs:
+        // 1. cancel running stages
+        // 2. clean up the stages from DAGScheduler if no active jobs depending on them, waiting
+        //    stages will be removed and won't be submitted.
+        // As we abort all the succeeding active jobs, all the succeeding stages should be
+        // cleaned up.
+        abortStage(stage, reason, exception = None)
+      }
+  }
+
+  // In rollbackSucceedingStages, we assume that the jobs are independent even if they reuse
+  // the same shuffle. If an active job hits fetch failure and keeps retrying upstream stages
+  // cascadingly, and a shuffle checksum mismatch is detected, these retried stages will be
+  // fully rolled back if possible, or the job will be aborted. However, we won't do anything for
+  // the other active jobs.
+  //
+  // For SQL query execution, all the jobs from the same query are related as they all contribute
+  // to the query result in some ways. For example, the jobs for subquery expressions are not part
+  // of the main query RDD, but they are still related. We need to guarantee the consistency of all
+  // the jobs, which means if a shuffle stage hits checksum mismatch, all its downstream stages in
+  // all the jobs of the same query execution should be rolled back if possible.
+  //
+  // This method does:
+  // 1. Find all the jobs triggered by the same query execution including the completed ones.
+  // 2. Find all the succeeding stages of the checksum mismatch shuffle stage based on shuffle id
+  //    as stage can be different in different jobs even they share the same shuffle.
+  // 3. Abort succeeding stages if their leaf result stages have started running.
+  // 4. Clean up shuffle outputs of the checksum mismatched shuffle stages which are available to
+  //    make sure all these stages would be resubmitted and fully retied.
+  // 5. Cancel running shuffle map stages and resubmit.
+  private[scheduler] def rollbackSucceedingStagesForQuery(mapStage: ShuffleMapStage): Unit = {
+    // Find the completed jobs triggered by the same query execution.
+    val completedJobs = getCompletedJobsFromSameQuery(mapStage)
+    val succeedingStagesInCompletedJobs =
+      collectSucceedingStagesByShuffleId(mapStage, completedJobs)
+    logInfo(log"Found succeeding stages ${MDC(STAGES, succeedingStagesInCompletedJobs)} of " +
+      log"shuffle checksum mismatch stage ${MDC(STAGE, mapStage)} in completed jobs: (" +
+      log"${MDC(JOB_IDS, completedJobs.map(_.jobId).mkString(","))})")
+
+    // Abort all the succeeding final stages in active jobs to fail fast and avoid wasting
+    // resources if there are succeeding result stages in completed jobs.
+    val completedResultStages =
+      succeedingStagesInCompletedJobs.collect { case r: ResultStage => r }
+    if (completedResultStages.nonEmpty) {
+      val reason = s"cannot rollback completed result stages ${completedResultStages}, " +
+        s"please re-run the query to ensure data correctness"
+      abortSucceedingFinalStages(mapStage, reason)
+      return
+    }
+
+    // Rollback the succeeding stages in active jobs. If there are no active jobs left after
+    // rollback, we can skip the rollback for completed jobs.
+    val hasActiveJobs = rollbackSucceedingStages(mapStage)
+    if (hasActiveJobs) {
+      // Rollback the shuffle map stages in completed jobs to make sure the completed shuffle
+      // map stages would be re-submitted and fully retried.
+      succeedingStagesInCompletedJobs.collect { case s: ShuffleMapStage => s }
+        .foreach(stage => rollbackShuffleMapStage(stage, "rolling back due to indeterminate " +
+          s"output of shuffle map stage $mapStage"))
+    } else {
+      logInfo(log"All jobs depending on the checksum mismatch stage " +
+        log"(${MDC(STAGE_ID, mapStage.id)}) were aborted, skip the rollback.")
     }
   }
 
@@ -1987,19 +2894,13 @@ private[spark] class DAGScheduler(
     }
 
     stage.failedAttemptIds.add(stage.latestInfo.attemptNumber())
-    val shouldAbortStage = stage.failedAttemptIds.size >= maxConsecutiveStageAttempts ||
-      disallowStageRetryForTest
+    val abortReason = stageAbortReason(stage, reason)
+    val shouldAbortStage = abortReason.isDefined
     markStageAsFinished(stage, Some(reason), willRetry = !shouldAbortStage)
 
     if (shouldAbortStage) {
-      val abortMessage = if (disallowStageRetryForTest) {
-        "Stage will not retry stage due to testing config. Most recent failure " +
-          s"reason: $reason"
-      } else {
-        s"$stage (${stage.name}) has failed the maximum allowable number of " +
-          s"times: $maxConsecutiveStageAttempts. Most recent failure reason: $reason"
-      }
-      abortStage(stage, s"rollback failed due to: $abortMessage", None)
+      abortStage(stage,
+        s"rollback failed due to: ${abortReason.get}", None)
     } else {
       // In case multiple task failures triggered for a single stage attempt, ensure we only
       // resubmit the failed stage once.
@@ -2008,13 +2909,7 @@ private[spark] class DAGScheduler(
       if (noResubmitEnqueued) {
         logInfo(log"Resubmitting ${MDC(FAILED_STAGE, stage)} " +
           log"(${MDC(FAILED_STAGE_NAME, stage.name)}) due to rollback.")
-        messageScheduler.schedule(
-          new Runnable {
-            override def run(): Unit = eventProcessLoop.post(ResubmitFailedStages)
-          },
-          DAGScheduler.RESUBMIT_TIMEOUT,
-          TimeUnit.MILLISECONDS
-        )
+        scheduleResubmit()
       }
     }
 
@@ -2049,6 +2944,34 @@ private[spark] class DAGScheduler(
     }
 
     val stage = stageIdToStage(task.stageId)
+
+    // Group-observable completion (spec S5): if this stage is a pipelined consumer co-scheduled
+    // with a still-running pipelined producer, defer its *successful* completion in full until the
+    // producer(s) finish. Buffer the whole CompletionEvent and return before ANY of its side
+    // effects run. Buffering the whole event DEFERS all three of those effects -- the accumulator
+    // update, the task-end listener event, and stage/job completion -- until the event is replayed;
+    // it is NOT just the stage/job-completion bookkeeping that waits. (A listener-visible
+    // consequence: a consumer task that finishes ahead of its producer emits no SparkListenerTaskEnd
+    // until the producer finishes, so the Spark UI reports that already-succeeded task as still
+    // running for the producer's remaining lifetime.) Else a consumer finishing ahead of its
+    // producer would advance job completion and cancel the still-running producer (via
+    // cancelRunningIndependentStages), or expose its output early.
+    // Deferring the entire event is what makes the side effects run exactly ONCE, at replay:
+    // releaseDeferredPipelinedConsumers re-posts the buffered event once the last producer completes
+    // (or drops it if a producer fails, S6), and it then re-enters here and runs the side effects
+    // normally. This deferral check must therefore precede updateAccumulators and postTaskEnd. Inert
+    // for jobs with no pipelined dependency (the map is empty), so the regular path is unchanged.
+    if (event.reason == Success) {
+      dependentStageMap.get(stage) match {
+        case Some(deferral) if deferral.parents.nonEmpty =>
+          logInfo(log"Deferring completion of task ${MDC(TASK_ID, event.taskInfo.taskId)} in " +
+            log"pipelined consumer ${MDC(STAGE, stage)} until its producer(s) " +
+            log"${MDC(MISSING_PARENT_STAGES, deferral.parents.toSeq)} finish")
+          deferral.delayedTaskCompletionEvents += event
+          return
+        case _ =>
+      }
+    }
 
     // Make sure the task's accumulators are updated before any other processing happens, so that
     // we can post a task end event before any jobs or stages are updated. The accumulators are
@@ -2086,22 +3009,18 @@ private[spark] class DAGScheduler(
         // tasks complete, they still count and we can mark the corresponding partitions as
         // finished if the stage is determinate. Here we notify the task scheduler to skip running
         // tasks for the same partition to save resource.
-        def stageWithChecksumMismatchFullRetryEnabled(stage: Stage): Boolean = {
-          stage match {
-            case s: ShuffleMapStage => s.shuffleDep.checksumMismatchFullRetryEnabled
-            case _ => stage.parents.exists(stageWithChecksumMismatchFullRetryEnabled)
-          }
-        }
 
-        // Ignore task completion for old attempt of indeterminate stage
-        val ignoreOldTaskAttempts = if (stageWithChecksumMismatchFullRetryEnabled(stage)) {
+        // Ignore task completion for old attempt of stages with nondeterministic output.
+        // This is tracked via maxAttemptIdToIgnore which is set when a stage is rolled back.
+        val ignoreOldTaskAttempts =
           stage.maxAttemptIdToIgnore.exists(_ >= task.stageAttemptId)
-        } else {
-          stage.isIndeterminate && task.stageAttemptId < stage.latestInfo.attemptNumber()
-        }
 
         if (!ignoreOldTaskAttempts && task.stageAttemptId < stage.latestInfo.attemptNumber()) {
           taskScheduler.notifyPartitionCompletion(stageId, task.partitionId)
+        }
+
+        if (Utils.isTesting && !ignoreOldTaskAttempts) {
+          maybeApplyDelayedCorruptionForTest(stage)
         }
 
         task match {
@@ -2175,23 +3094,32 @@ private[spark] class DAGScheduler(
                 // The epoch of the task is acceptable (i.e., the task was launched after the most
                 // recent failure we're aware of for the executor), so mark the task's output as
                 // available.
+                if (Utils.isTesting &&
+                    sc.conf.get(config.Tests.INJECT_SHUFFLE_FETCH_FAILURES) &&
+                    shouldCorruptShuffleOutputForTest(shuffleStage.shuffleDep.shuffleId, task)) {
+                  corruptShuffleOutputForTest(shuffleStage.shuffleDep.shuffleId, status)
+                }
                 val isChecksumMismatched = mapOutputTracker.registerMapOutput(
-                  shuffleStage.shuffleDep.shuffleId, smt.partitionId, status)
+                    shuffleStage.shuffleDep.shuffleId, smt.partitionId, status) ||
+                  (Utils.isTesting &&
+                    isForcedChecksumMismatchForTest(shuffleStage.shuffleDep.shuffleId, task))
                 if (isChecksumMismatched) {
                   shuffleStage.isChecksumMismatched = isChecksumMismatched
-                  // There could be multiple checksum mismatches detected for a single stage attempt.
-                  // We check for stage abortion once and only once when we first detect checksum
-                  // mismatch for each stage attempt. For example, assume that we have
-                  // stage1 -> stage2, and we encounter checksum mismatch during the retry of stage1.
-                  // In this case, we need to call abortUnrollbackableStages() for the succeeding
-                  // stages. Assume that when stage2 is retried, some tasks finish and some tasks
-                  // failed again with FetchFailed. In case that we encounter checksum mismatch again
-                  // during the retry of stage1, we need to call abortUnrollbackableStages() again.
-                  if (shuffleStage.maxChecksumMismatchedId < smt.stageAttemptId) {
-                    shuffleStage.maxChecksumMismatchedId = smt.stageAttemptId
-                    if (shuffleStage.shuffleDep.checksumMismatchFullRetryEnabled
-                      && shuffleStage.isStageIndeterminate) {
-                      rollbackSucceedingStages(shuffleStage)
+                  // Runtime detection of nondeterministic output via checksum mismatch.
+                  // This is the trigger point for runtime detection - we only know the stage
+                  // is indeterminate when we see different checksums from different attempts.
+                  //
+                  // Note: Static detection (isStaticallyIndeterminate) is triggered earlier
+                  // in FetchFailed handler and submitMissingTasks for efficiency.
+                  if (shuffleStage.shuffleDep.checksumMismatchFullRetryEnabled
+                      && shuffleStage.isRuntimeIndeterminate) {
+                    if (shuffleStage.maxChecksumMismatchedId < smt.stageAttemptId) {
+                      shuffleStage.maxChecksumMismatchedId = smt.stageAttemptId
+                      if (shuffleStage.shuffleDep.checksumMismatchQueryLevelRollbackEnabled) {
+                        rollbackSucceedingStagesForQuery(shuffleStage)
+                      } else {
+                        rollbackSucceedingStages(shuffleStage)
+                      }
                     }
                   }
                 }
@@ -2235,9 +3163,8 @@ private[spark] class DAGScheduler(
             failedStage.failedAttemptIds.add(task.stageAttemptId)
           }
 
-          val shouldAbortStage =
-            failedStage.failedAttemptIds.size >= maxConsecutiveStageAttempts ||
-            disallowStageRetryForTest
+          val abortReason = stageAbortReason(failedStage, failureMessage)
+          val shouldAbortStage = abortReason.isDefined
 
           // It is likely that we receive multiple FetchFailed for a single stage (because we have
           // multiple tasks running concurrently on different executors). In that case, it is
@@ -2298,33 +3225,27 @@ private[spark] class DAGScheduler(
           }
 
           if (shouldAbortStage) {
-            val abortMessage = if (disallowStageRetryForTest) {
-              "Fetch failure will not retry stage due to testing config"
-            } else {
-              s"$failedStage (${failedStage.name}) has failed the maximum allowable number of " +
-                s"times: $maxConsecutiveStageAttempts. Most recent failure reason:\n" +
-                failureMessage
-            }
-            abortStage(failedStage, abortMessage, None)
+            abortStage(failedStage, abortReason.get, None)
           } else { // update failedStages and make sure a ResubmitFailedStages event is enqueued
             // TODO: Cancel running tasks in the failed stage -- cf. SPARK-17064
             val noResubmitEnqueued = !failedStages.contains(failedStage)
             failedStages += failedStage
             failedStages += mapStage
             if (noResubmitEnqueued) {
-              // If the map stage is INDETERMINATE, which means the map tasks may return
-              // different result when re-try, we need to re-try all the tasks of the failed
-              // stage and its succeeding stages, because the input data will be changed after the
-              // map tasks are re-tried.
-              // Note that, if map stage is UNORDERED, we are fine. The shuffle partitioner is
-              // guaranteed to be determinate, so the input data of the reducers will not change
-              // even if the map tasks are re-tried.
-              if (mapStage.isIndeterminate && !mapStage.shuffleDep.checksumMismatchFullRetryEnabled) {
-                val stagesToRollback = collectSucceedingStages(mapStage)
-                val stagesCanRollback = filterAndAbortUnrollbackableStages(stagesToRollback)
-                logInfo(log"The shuffle map stage ${MDC(STAGE, mapStage)} with indeterminate output " +
-                  log"was failed, we will roll back and rerun below stages which include itself and all " +
-                  log"its indeterminate child stages: ${MDC(STAGES, stagesCanRollback)}")
+              // For statically indeterminate stages, trigger rollback early (here and in
+              // submitMissingTasks) rather than deferring to task completion. This is more
+              // efficient because it clears shuffle outputs before the retry is submitted,
+              // ensuring findMissingPartitions() returns all partitions.
+              //
+              // For runtime detection (checksum mismatch), rollback is triggered at task
+              // completion when the mismatch is discovered.
+              //
+              // The `rollbackCurrentStage = true` parameter ensures the failed map stage is
+              // included in the cleanup: clearing its shuffle outputs, marking old task results
+              // to be ignored, and creating a new shuffle merge state for the upcoming retry.
+              if (mapStage.isStaticallyIndeterminate &&
+                  !mapStage.shuffleDep.checksumMismatchFullRetryEnabled) {
+                rollbackSucceedingStages(mapStage, rollbackCurrentStage = true)
               }
 
               // We expect one executor failure to trigger many FetchFailures in rapid succession,
@@ -2339,13 +3260,7 @@ private[spark] class DAGScheduler(
                 log"Resubmitting ${MDC(STAGE, mapStage)} " +
                 log"(${MDC(STAGE_NAME, mapStage.name)}) and ${MDC(FAILED_STAGE, failedStage)} " +
                 log"(${MDC(FAILED_STAGE_NAME, failedStage.name)}) due to fetch failure")
-              messageScheduler.schedule(
-                new Runnable {
-                  override def run(): Unit = eventProcessLoop.post(ResubmitFailedStages)
-                },
-                DAGScheduler.RESUBMIT_TIMEOUT,
-                TimeUnit.MILLISECONDS
-              )
+              scheduleResubmit()
             }
           }
 
@@ -2426,19 +3341,11 @@ private[spark] class DAGScheduler(
           failedStage.failedAttemptIds.add(task.stageAttemptId)
           // TODO Refactor the failure handling logic to combine similar code with that of
           // FetchFailed.
-          val shouldAbortStage =
-            failedStage.failedAttemptIds.size >= maxConsecutiveStageAttempts ||
-              disallowStageRetryForTest
+          val abortReason = stageAbortReason(failedStage, message)
+          val shouldAbortStage = abortReason.isDefined
 
           if (shouldAbortStage) {
-            val abortMessage = if (disallowStageRetryForTest) {
-              "Barrier stage will not retry stage due to testing config. Most recent failure " +
-                s"reason: $message"
-            } else {
-              s"$failedStage (${failedStage.name}) has failed the maximum allowable number of " +
-                s"times: $maxConsecutiveStageAttempts. Most recent failure reason: $message"
-            }
-            abortStage(failedStage, abortMessage, None)
+            abortStage(failedStage, abortReason.get, None)
           } else {
             failedStage match {
               case failedMapStage: ShuffleMapStage =>
@@ -2460,9 +3367,7 @@ private[spark] class DAGScheduler(
             if (noResubmitEnqueued) {
               logInfo(log"Resubmitting ${MDC(FAILED_STAGE, failedStage)} " +
                 log"(${MDC(FAILED_STAGE_NAME, failedStage.name)}) due to barrier stage failure.")
-              messageScheduler.schedule(new Runnable {
-                override def run(): Unit = eventProcessLoop.post(ResubmitFailedStages)
-              }, DAGScheduler.RESUBMIT_TIMEOUT, TimeUnit.MILLISECONDS)
+              scheduleResubmit()
             }
           }
         }
@@ -2479,10 +3384,36 @@ private[spark] class DAGScheduler(
       case TaskResultLost =>
         // Do nothing here; the TaskScheduler handles these failures and resubmits the task.
 
-      case _: ExecutorLostFailure | UnknownReason =>
+      case _: ExecutorLostFailure | _: ExecutorShutdownFailure | UnknownReason =>
         // Unrecognized failure - also do nothing. If the task fails repeatedly, the TaskScheduler
         // will abort the job.
     }
+  }
+
+  private def collectSucceedingStagesByShuffleId(
+      mapStage: ShuffleMapStage, jobs: Array[ActiveJob]): HashSet[Stage] = {
+    val succeedingStages = HashSet[Stage]()
+    val shuffleId = mapStage.shuffleDep.shuffleId
+
+    def getShuffleId(stage: Stage): Option[Int] = stage match {
+      case s: ShuffleMapStage => Some(s.shuffleDep.shuffleId)
+      case _ => None
+    }
+
+    def collectSucceedingStagesInternal(stageChain: List[Stage]): Unit = {
+      val head = stageChain.head
+      if (getShuffleId(head).contains(shuffleId)) {
+        stageChain.drop(1).foreach { s =>
+          succeedingStages += s
+        }
+      } else {
+        head.parents.foreach { s =>
+          collectSucceedingStagesInternal(s :: stageChain)
+        }
+      }
+    }
+    jobs.foreach(job => collectSucceedingStagesInternal(job.finalStage :: Nil))
+    succeedingStages
   }
 
   private def collectSucceedingStages(mapStage: ShuffleMapStage): HashSet[Stage] = {
@@ -2535,10 +3466,17 @@ private[spark] class DAGScheduler(
               "shuffle block fetching protocol. Please check the config " +
               "'spark.shuffle.useOldFetchProtocol', see more detail in " +
               "SPARK-27665 and SPARK-25341."
-            abortStage(mapStage, reason, None)
+            // We should abort the final stages to make sure the job fails. Otherwise, nothing
+            // would happen if the shuffle output are available since the job would be considered
+            // as no longer depending on the stage.
+            mapStage.jobIds.flatMap(jobIdToActiveJob.get)
+              .map(_.finalStage)
+              .foreach(abortStage(_, reason, None))
           } else {
             rollingBackStages += mapStage
           }
+        } else if (runningStages.contains(mapStage)) {
+          rollingBackStages += mapStage
         }
 
       case resultStage: ResultStage if resultStage.activeJob.isDefined =>
@@ -2546,6 +3484,10 @@ private[spark] class DAGScheduler(
         if (numMissingPartitions < resultStage.numTasks) {
           // TODO: support to rollback result tasks.
           abortStage(resultStage, generateErrorMessage(resultStage), None)
+        } else if (runningStages.contains(resultStage)) {
+          val reason = "cannot rollback a running result stage, please re-run the query " +
+            "to ensure data correctness"
+          abortStage(resultStage, reason, None)
         }
 
       case _ =>
@@ -2819,11 +3761,11 @@ private[spark] class DAGScheduler(
       if (stage.pendingPartitions.isEmpty)
         if (runningStages.contains(stage)) {
           processShuffleMapStageCompletion(stage)
-        } else if (stage.isIndeterminate) {
+        } else if (stage.isStaticallyIndeterminate) {
           // There are 2 possibilities here - stage is either cancelled or it will be resubmitted.
-          // If this is an indeterminate stage which is cancelled, we unregister all its merge
-          // results here just to free up some memory. If the indeterminate stage is resubmitted,
-          // merge results are cleared again when the newer attempt is submitted.
+          // If this is a statically indeterminate stage which is cancelled, we unregister all its
+          // merge results here just to free up some memory. If the indeterminate stage is
+          // resubmitted, merge results are cleared again when the newer attempt is submitted.
           mapOutputTracker.unregisterAllMergeResult(stage.shuffleDep.shuffleId)
           // For determinate stages, which have completed merge finalization, we don't need to
           // unregister merge results - since the stage retry, or any other stage computing the
@@ -3056,8 +3998,12 @@ private[spark] class DAGScheduler(
 
   /**
    * Marks a stage as finished and removes it from the list of running stages.
+   *
+   * `private[scheduler]` (not `private`) so tests can drive the pipelined-consumer release/retain
+   * decision below directly, including the retained branch (a not-yet-available pipelined producer
+   * about to resubmit), which is otherwise brittle to reach through the mock backend.
    */
-  private def markStageAsFinished(
+  private[scheduler] def markStageAsFinished(
       stage: Stage,
       errorMessage: Option[String] = None,
       willRetry: Boolean = false): Unit = {
@@ -3086,6 +4032,81 @@ private[spark] class DAGScheduler(
     }
     listenerBus.post(SparkListenerStageCompleted(stage.latestInfo))
     runningStages -= stage
+
+    // Release any pipelined consumers whose completion was deferred while this stage (a pipelined
+    // producer) was running. Only act when the producer's outcome is final:
+    //  - willRetry: the stage is being retried, not finished -- leave consumers deferred.
+    //  - a ShuffleMapStage that finished "successfully" (no errorMessage) but is NOT yet available
+    //    (e.g. a bogus-epoch task left an output missing) is about to be resubmitted by
+    //    processShuffleMapStageCompletion -- it is not truly done, so do NOT replay its consumers
+    //    against soon-to-be-recomputed output; the release happens when its reattempt completes and
+    //    it becomes available.
+    // Otherwise: producerFailed = the stage failed (errorMessage set) -> drop the consumers'
+    // buffered successes; producer succeeded -> replay them.
+    if (!willRetry) {
+      val producerFailed = errorMessage.isDefined
+      val producerAboutToResubmit = stage match {
+        case m: ShuffleMapStage => !producerFailed && !m.isAvailable
+        case _ => false
+      }
+      if (!producerAboutToResubmit) {
+        releaseDeferredPipelinedConsumers(stage, producerFailed = producerFailed)
+      }
+    }
+  }
+
+  /**
+   * Called when a stage finishes. If `finishedStage` is a pipelined producer that some co-scheduled
+   * consumer was deferred on, resolve that consumer's deferral:
+   *  - Producer FAILED: drop the consumer's buffered completions immediately, regardless of whether
+   *    it still has other pending producers. A pipelined group is failed as a unit (S6), so once a
+   *    producer fails the consumer's buffered successes must not be applied -- and dropping now,
+   *    rather than remembering the failure until the last producer finishes, means no failure state
+   *    outlives this call (a surviving producer that later finishes just finds the consumer gone).
+   *  - Producer SUCCEEDED: remove it from the consumer's pending-producer set, and replay the
+   *    buffered completions only once the LAST producer has succeeded (the set becomes empty).
+   * Inert unless `finishedStage` is a tracked producer. Recovery from a drop, if any, is a caller
+   * rerun of the whole group (a new job, S6) -- the scheduler does not rerun the group in place.
+   */
+  private def releaseDeferredPipelinedConsumers(
+      finishedStage: Stage, producerFailed: Boolean): Unit = {
+    if (dependentStageMap.isEmpty) {
+      return
+    }
+    // Consumers waiting on this producer.
+    val released = dependentStageMap.filter {
+      case (_, d) => d.parents.contains(finishedStage)
+    }.keys.toArray
+    for (consumer <- released) {
+      val deferral = dependentStageMap(consumer)
+      deferral.parents -= finishedStage
+      if (producerFailed) {
+        // Drop immediately: the group is being failed as a unit, so this consumer's buffered
+        // successes must not be applied no matter what its other producers do. Removing the entry
+        // now leaves no deferral state to go stale for a later re-co-scheduling of this stage.
+        // Treating producerFailed as terminal is sound because every failure path that reaches a
+        // pipelined member's markStageAsFinished(errorMessage) here is terminal for the group: the
+        // one base path that fails a stage and then resubmits it (a barrier task failure) cannot
+        // occur, because a barrier member is rejected up front (rejectUnadmittablePipelinedGroup),
+        // so a pipelined group never contains one.
+        dependentStageMap -= consumer
+        val events = deferral.delayedTaskCompletionEvents.toList
+        logInfo(log"Dropping ${MDC(NUM_EVENTS, events.size.toLong)} deferred completion(s) for " +
+          log"pipelined consumer ${MDC(STAGE, consumer)} because a producer failed; failing the " +
+          log"group")
+        // The buffered tasks genuinely succeeded, so still emit their TaskEnd events -- otherwise
+        // listeners that track active tasks (e.g. AppStatusListener) would believe these tasks are
+        // still running. We deliberately do NOT run the stage/job completion bookkeeping: the group
+        // is being failed as a unit, so the consumer's results must not be applied.
+        events.foreach(postTaskEnd)
+      } else if (deferral.parents.isEmpty) {
+        dependentStageMap -= consumer
+        val events = deferral.delayedTaskCompletionEvents.toList
+        logInfo(log"Replaying ${MDC(NUM_EVENTS, events.size.toLong)} deferred completion(s) " +
+          log"for pipelined consumer ${MDC(STAGE, consumer)} now that its producers finished")
+        events.foreach(eventProcessLoop.post)
+      }
+    }
   }
 
   /**
@@ -3198,31 +4219,24 @@ private[spark] class DAGScheduler(
     if (stage == target) {
       return true
     }
-    val visitedRdds = new HashSet[RDD[_]]
-    // We are manually maintaining a stack here to prevent StackOverflowError
-    // caused by recursively visiting
-    val waitingForVisit = new ListBuffer[RDD[_]]
-    waitingForVisit += stage.rdd
-    def visit(rdd: RDD[_]): Unit = {
-      if (!visitedRdds(rdd)) {
-        visitedRdds += rdd
+    !traverseRDDGraphUntil(stage.rdd) { (rdd, enqueue) =>
+      if (rdd == target.rdd) {
+        false
+      } else {
         for (dep <- rdd.dependencies) {
           dep match {
             case shufDep: ShuffleDependency[_, _, _] =>
               val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
               if (!mapStage.isAvailable) {
-                waitingForVisit.prepend(mapStage.rdd)
+                enqueue(mapStage.rdd)
               }  // Otherwise there's no need to follow the dependency back
             case narrowDep: NarrowDependency[_] =>
-              waitingForVisit.prepend(narrowDep.rdd)
+              enqueue(narrowDep.rdd)
           }
         }
+        true
       }
     }
-    while (waitingForVisit.nonEmpty) {
-      visit(waitingForVisit.remove(0))
-    }
-    visitedRdds.contains(target.rdd)
   }
 
   /**
@@ -3357,6 +4371,9 @@ private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler
 
     case AllJobsCancelled =>
       dagScheduler.doCancelAllJobs()
+
+    case CleanupQueryJobs(executionId) =>
+      dagScheduler.doCleanupQueryJobs(executionId)
 
     case ExecutorAdded(execId, host) =>
       dagScheduler.handleExecutorAdded(execId, host)

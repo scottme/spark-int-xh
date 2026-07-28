@@ -15,7 +15,6 @@
 # limitations under the License.
 #
 import uuid
-import unittest
 
 from pyspark.sql.tests.connect.test_connect_basic import SparkConnectSQLTestCase
 
@@ -32,6 +31,10 @@ class SparkConnectCloneSessionTest(SparkConnectSQLTestCase):
 
         # Clone the session
         cloned_session = self.connect.cloneSession()
+
+        # The cloned session bypasses SparkSession.__init__, so make sure it still
+        # carries the attributes that SparkSession.stop() reads.
+        self.assertTrue(cloned_session.release_session_on_close)
 
         # Verify the configuration was copied
         # (if cloning doesn't preserve dynamic configs, use a different approach)
@@ -142,12 +145,6 @@ class SparkConnectCloneSessionTest(SparkConnectSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.test_connect_clone_session import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

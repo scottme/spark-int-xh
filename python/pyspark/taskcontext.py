@@ -14,18 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from typing import ClassVar, Type, Dict, List, Optional, Union, cast, TYPE_CHECKING
+from typing import Any, ClassVar, Type, TypeVar, Dict, List, Optional, Union, cast
 
 from pyspark.util import local_connect_and_auth
 from pyspark.serializers import read_int, write_int, write_with_length, UTF8Deserializer
 from pyspark.errors import PySparkRuntimeError
+from pyspark.resource import ResourceInformation
 
-if TYPE_CHECKING:
-    from pyspark.resource import ResourceInformation
+T = TypeVar("T", bound="TaskContext")
 
 
 class TaskContext:
-
     """
     Contextual information about a task which can be read or mutated during
     execution. To access the TaskContext for a running task, use:
@@ -129,9 +128,10 @@ class TaskContext:
     _taskAttemptId: Optional[int] = None
     _localProperties: Optional[Dict[str, str]] = None
     _cpus: Optional[int] = None
+    _cpuAmount: Optional[float] = None
     _resources: Optional[Dict[str, "ResourceInformation"]] = None
 
-    def __new__(cls: Type["TaskContext"]) -> "TaskContext":
+    def __new__(cls: Type["TaskContext"], **kwargs: Any) -> "TaskContext":
         """
         Even if users construct :class:`TaskContext` instead of using get, give them the singleton.
         """
@@ -141,6 +141,19 @@ class TaskContext:
         cls._taskContext = taskContext = object.__new__(cls)
         return taskContext
 
+    def __init__(
+        self,
+        **kwargs: Any,
+    ) -> None:
+        # Set attributes only if they are passed in and not None
+        # The kwargs are auto-mapped to the private attributes of TaskContext
+        # e.g., stageId -> _stageId
+        for key, val in kwargs.items():
+            if not hasattr(self, f"_{key}"):
+                raise TypeError(f"__init__() got an unexpected keyword argument '{key}'")
+            if val is not None:
+                setattr(self, f"_{key}", val)
+
     @classmethod
     def _getOrCreate(cls: Type["TaskContext"]) -> "TaskContext":
         """Internal function to get or create global :class:`TaskContext`."""
@@ -149,7 +162,7 @@ class TaskContext:
         return cls._taskContext
 
     @classmethod
-    def _setTaskContext(cls: Type["TaskContext"], taskContext: "TaskContext") -> None:
+    def _setTaskContext(cls: Type["TaskContext"], taskContext: Optional["TaskContext"]) -> None:
         cls._taskContext = taskContext
 
     @classmethod
@@ -167,6 +180,25 @@ class TaskContext:
         Must be called on the worker, not the driver. Returns ``None`` if not initialized.
         """
         return cls._taskContext
+
+    @classmethod
+    def from_json(cls: Type[T], json: dict) -> T:
+        """
+        Create a TaskContext from a JSON dictionary.
+        """
+        return cls(
+            stageId=json["stageId"],
+            partitionId=json["partitionId"],
+            attemptNumber=json["attemptNumber"],
+            taskAttemptId=json["taskAttemptId"],
+            cpus=json["cpus"],
+            cpuAmount=float(json["cpuAmount"]) if "cpuAmount" in json else None,
+            resources={
+                k: ResourceInformation(v["name"], v["addresses"])
+                for k, v in json["resources"].items()
+            },
+            localProperties=json["localProperties"],
+        )
 
     def stageId(self) -> int:
         """
@@ -233,7 +265,9 @@ class TaskContext:
 
     def cpus(self) -> int:
         """
-        CPUs allocated to the task.
+        CPUs allocated to the task, rounded up to a whole number when the exact
+        allocation is fractional. Use :meth:`TaskContext.cpuAmount` to get the exact,
+        possibly fractional, amount.
 
         Returns
         -------
@@ -241,6 +275,25 @@ class TaskContext:
             the number of CPUs.
         """
         return cast(int, self._cpus)
+
+    def cpuAmount(self) -> float:
+        """
+        The exact amount of CPUs allocated to the task. This can be fractional when
+        ``spark.task.cpus`` or the task resource profile requests a fractional amount
+        (e.g. 0.5).
+
+        .. versionadded:: 4.3.0
+
+        Returns
+        -------
+        float
+            the exact, possibly fractional, amount of CPUs.
+
+        See Also
+        --------
+        TaskContext.cpus
+        """
+        return cast(float, self._cpuAmount)
 
     def resources(self) -> Dict[str, "ResourceInformation"]:
         """
@@ -269,7 +322,7 @@ def _load_from_socket(
     Load data from a given socket, this is a blocking method thus only return when the socket
     connection has been closed.
     """
-    (sockfile, sock) = local_connect_and_auth(conn_info, auth_secret)
+    sockfile, sock = local_connect_and_auth(conn_info, auth_secret)
 
     # The call may block forever, so no timeout
     sock.settimeout(None)
@@ -299,7 +352,6 @@ def _load_from_socket(
 
 
 class BarrierTaskContext(TaskContext):
-
     """
     A :class:`TaskContext` with extra contextual info and tooling for tasks in a barrier stage.
     Use :func:`BarrierTaskContext.get` to obtain the barrier context for a running barrier task.
@@ -374,6 +426,14 @@ class BarrierTaskContext(TaskContext):
         """
         cls._conn_info = conn_info
         cls._secret = secret
+
+    @classmethod
+    def from_json(cls: Type["BarrierTaskContext"], json: dict) -> "BarrierTaskContext":
+        """
+        Create a BarrierTaskContext from a JSON dictionary.
+        """
+        cls._initialize(json["connInfo"], json["secret"])
+        return super().from_json(json)
 
     def barrier(self) -> None:
         """
@@ -493,7 +553,7 @@ def _test() -> None:
     globs["spark"] = (
         SparkSession.builder.master("local[2]").appName("taskcontext tests").getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     globs["spark"].stop()
 
     if failure_count:

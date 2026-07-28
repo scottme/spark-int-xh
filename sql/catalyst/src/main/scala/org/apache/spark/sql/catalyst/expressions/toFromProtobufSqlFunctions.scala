@@ -19,11 +19,10 @@ package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
-import org.apache.spark.sql.catalyst.util.ArrayBasedMapData
+import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ProtobufDescriptorFileReader}
 import org.apache.spark.sql.errors.DataTypeErrors.toSQLType
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.types.{BinaryType, MapType, NullType, StringType, StructType}
-import org.apache.spark.sql.util.ProtobufUtils
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.Utils
 
@@ -58,7 +57,7 @@ import org.apache.spark.util.Utils
     To deserialize the data with a compatible and evolved schema, the expected Protobuf schema can be
     set via the corresponding option.
   """,
-  group = "misc_funcs",
+  group = "protobuf_funcs",
   since = "4.0.0"
 )
 // scalastyle:on line.size.limit
@@ -142,7 +141,8 @@ case class FromProtobuf(
     }
     val descFilePathValue: Option[Array[Byte]] = descFilePath.eval() match {
       case s: UTF8String if s.toString.isEmpty => None
-      case s: UTF8String => Some(ProtobufUtils.readDescriptorFileContent(s.toString))
+      case s: UTF8String =>
+        Some(ProtobufDescriptorFileReader.readDescriptorFileContent(s.toString))
       case bytes: Array[Byte] if bytes.isEmpty => None
       case bytes: Array[Byte] => Some(bytes)
       case null => None
@@ -195,7 +195,7 @@ case class FromProtobuf(
       > SELECT _FUNC_(s, 'Person', '/path/to/descriptor.desc', map('emitDefaultValues', 'true')) IS NULL FROM (SELECT NULL AS s);
        [true]
   """,
-  group = "misc_funcs",
+  group = "protobuf_funcs",
   since = "4.0.0"
 )
 // scalastyle:on line.size.limit
@@ -292,7 +292,8 @@ case class ToProtobuf(
         s.toString
     }
     val descFilePathValue: Option[Array[Byte]] = descFilePath.eval() match {
-      case s: UTF8String => Some(ProtobufUtils.readDescriptorFileContent(s.toString))
+      case s: UTF8String =>
+        Some(ProtobufDescriptorFileReader.readDescriptorFileContent(s.toString))
       case bytes: Array[Byte] => Some(bytes)
       case null => None
     }

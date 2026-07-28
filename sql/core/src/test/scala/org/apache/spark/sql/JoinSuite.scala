@@ -40,11 +40,14 @@ import org.apache.spark.sql.types.StructType
 import org.apache.spark.tags.SlowSQLTest
 
 @SlowSQLTest
-class JoinSuite extends QueryTest with SharedSparkSession with AdaptiveSparkPlanHelper
+class JoinSuite extends SharedSparkSession with AdaptiveSparkPlanHelper
   with JoinSelectionHelper {
   import testImplicits._
 
   setupTestData()
+
+  override protected def sparkConf =
+    super.sparkConf.set(SQLConf.ADAPTIVE_MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD.key, "0")
 
   def statisticSizeInByte(df: classic.DataFrame): BigInt = {
     df.queryExecution.optimizedPlan.stats.sizeInBytes
@@ -1236,13 +1239,13 @@ class JoinSuite extends QueryTest with SharedSparkSession with AdaptiveSparkPlan
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> Long.MaxValue.toString) {
       // positive not in subquery case
       var joinExec = assertJoin((
-        "select * from testData where key not in (select a from testData2)",
+        "select * from testData where key not in (select b from testData3)",
         classOf[BroadcastHashJoinExec]))
       assert(joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
 
       // negative not in subquery case since multi-column is not supported
       assertJoin((
-        "select * from testData where (key, key + 1) not in (select * from testData2)",
+        "select * from testData where (key, key + 1) not in (select b, b + 1 from testData3)",
         classOf[BroadcastNestedLoopJoinExec]))
 
       // positive hand-written left anti join
@@ -1268,6 +1271,34 @@ class JoinSuite extends QueryTest with SharedSparkSession with AdaptiveSparkPlan
         "select * from testData2 left anti join testData3 ON testData2.a = testData3.b or " +
           "isnull(testData2.b = testData3.b)",
         classOf[BroadcastNestedLoopJoinExec]))
+    }
+  }
+
+  test("SPARK-54972: Improve not in subqueries with non-nullable columns") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> Long.MaxValue.toString) {
+      // testData.key nullable false
+      // testData2.* nullable false
+
+      val joinExec = assertJoin((
+        "select * from testData where key not in (select a from testData2)",
+        classOf[BroadcastHashJoinExec]))
+      assert(!joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
+
+      val joinExec2 = assertJoin((
+        "select * from testData where (key, key + 1) not in (select * from testData2)",
+        classOf[BroadcastHashJoinExec]))
+      assert(!joinExec2.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
+    }
+  }
+
+  test("SPARK-36082: only use SingleColumn Null Aware Anti Join when right side " +
+      "can broadcast") {
+    withSQLConf(SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "0") {
+      val joinExec = assertJoin((
+        "select * from testData where key not in (select b from testData3)",
+        classOf[BroadcastNestedLoopJoinExec]))
+      assert(!joinExec.isInstanceOf[BroadcastHashJoinExec])
     }
   }
 
@@ -1802,11 +1833,14 @@ class JoinSuite extends QueryTest with SharedSparkSession with AdaptiveSparkPlan
 }
 
 class ThreadLeakInSortMergeJoinSuite
-  extends QueryTest
-    with SharedSparkSession
+  extends SharedSparkSession
     with AdaptiveSparkPlanHelper {
 
   setupTestData()
+
+  override protected def sparkConf =
+    super.sparkConf.set(SQLConf.ADAPTIVE_MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD.key, "0")
+
   override protected def createSparkSession: TestSparkSession = {
     classic.SparkSession.cleanupAnyExistingSession()
     new TestSparkSession(

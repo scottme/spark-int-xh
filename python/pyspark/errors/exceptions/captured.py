@@ -102,12 +102,13 @@ class CapturedException(PySparkException):
         from py4j.java_gateway import is_instance_of
 
         assert SparkContext._gateway is not None
+        assert SparkContext._jvm is not None
 
         gw = SparkContext._gateway
         if self._origin is not None and is_instance_of(
             gw, self._origin, "org.apache.spark.SparkThrowable"
         ):
-            utils = SparkContext._jvm.PythonErrorUtils  # type: ignore[union-attr]
+            utils = SparkContext._jvm.PythonErrorUtils
             return utils.getCondition(self._origin)
         else:
             return None
@@ -121,12 +122,13 @@ class CapturedException(PySparkException):
         from py4j.java_gateway import is_instance_of
 
         assert SparkContext._gateway is not None
+        assert SparkContext._jvm is not None
 
         gw = SparkContext._gateway
         if self._origin is not None and is_instance_of(
             gw, self._origin, "org.apache.spark.SparkThrowable"
         ):
-            utils = SparkContext._jvm.PythonErrorUtils  # type: ignore[union-attr]
+            utils = SparkContext._jvm.PythonErrorUtils
             return dict(utils.getMessageParameters(self._origin))
         else:
             return None
@@ -136,11 +138,12 @@ class CapturedException(PySparkException):
         from py4j.java_gateway import is_instance_of
 
         assert SparkContext._gateway is not None
+        assert SparkContext._jvm is not None
         gw = SparkContext._gateway
         if self._origin is not None and is_instance_of(
             gw, self._origin, "org.apache.spark.SparkThrowable"
         ):
-            utils = SparkContext._jvm.PythonErrorUtils  # type: ignore[union-attr]
+            utils = SparkContext._jvm.PythonErrorUtils
             return utils.getSqlState(self._origin)
         else:
             return None
@@ -150,12 +153,13 @@ class CapturedException(PySparkException):
         from py4j.java_gateway import is_instance_of
 
         assert SparkContext._gateway is not None
+        assert SparkContext._jvm is not None
         gw = SparkContext._gateway
 
         if self._origin is not None and is_instance_of(
             gw, self._origin, "org.apache.spark.SparkThrowable"
         ):
-            utils = SparkContext._jvm.PythonErrorUtils  # type: ignore[union-attr]
+            utils = SparkContext._jvm.PythonErrorUtils
             errorClass = utils.getCondition(self._origin)
             messageParameters = utils.getMessageParameters(self._origin)
 
@@ -172,13 +176,14 @@ class CapturedException(PySparkException):
         from py4j.java_gateway import is_instance_of
 
         assert SparkContext._gateway is not None
+        assert SparkContext._jvm is not None
 
         gw = SparkContext._gateway
         if self._origin is not None and is_instance_of(
             gw, self._origin, "org.apache.spark.SparkThrowable"
         ):
             contexts: List[BaseQueryContext] = []
-            utils = SparkContext._jvm.PythonErrorUtils  # type: ignore[union-attr]
+            utils = SparkContext._jvm.PythonErrorUtils
             for q in utils.getQueryContext(self._origin):
                 if q.contextType().toString() == "SQL":
                     contexts.append(SQLQueryContext(q))
@@ -234,25 +239,13 @@ def _convert_exception(e: "Py4JJavaError") -> CapturedException:
         return SparkUpgradeException(origin=e)
     elif is_instance_of(gw, e, "org.apache.spark.SparkNoSuchElementException"):
         return SparkNoSuchElementException(origin=e)
-
-    c: "Py4JJavaError" = e.getCause()
-    stacktrace: str = getattr(jvm, "org.apache.spark.util.Utils").exceptionString(e)
-    if c is not None and (
-        is_instance_of(gw, c, "org.apache.spark.api.python.PythonException")
-        # To make sure this only catches Python UDFs.
-        and any(
-            map(
-                lambda v: "org.apache.spark.sql.execution.python" in v.toString(), c.getStackTrace()
-            )
-        )
-    ):
-        msg = (
-            "\n  An exception was thrown from the Python worker. "
-            "Please see the stack trace below.\n%s" % c.getMessage()
-        )
-        return PythonException(msg, stacktrace)
-
-    return UnknownException(desc=e.toString(), stackTrace=stacktrace, cause=c)
+    elif is_instance_of(gw, e, "org.apache.spark.api.python.PythonException"):
+        return PythonException(origin=e)
+    return UnknownException(
+        desc=e.toString(),
+        stackTrace=getattr(jvm, "org.apache.spark.util.Utils").exceptionString(e),
+        cause=e.getCause(),
+    )
 
 
 def capture_sql_exception(f: Callable[..., Any]) -> Callable[..., Any]:
@@ -347,6 +340,17 @@ class PythonException(CapturedException, BasePythonException):
     """
     Exceptions thrown from Python workers.
     """
+
+    def __str__(self) -> str:
+        messageParameters = self.getMessageParameters()
+
+        if (
+            messageParameters is None
+            or "msg" not in messageParameters
+            or "traceback" not in messageParameters
+        ):
+            return super().__str__()
+        return f"{messageParameters['msg']}:\n{messageParameters['traceback'].strip()}"
 
 
 class ArithmeticException(CapturedException, BaseArithmeticException):

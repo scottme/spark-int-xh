@@ -35,7 +35,7 @@ import org.apache.spark.util.collection.{BitSet, OpenHashSet}
 /**
  * Performs a hash join of two child relations by first shuffling the data using the join keys.
  */
-case class ShuffledHashJoinExec(
+case class ShuffledHashJoinExec private (
     leftKeys: Seq[Expression],
     rightKeys: Seq[Expression],
     joinType: JoinType,
@@ -270,14 +270,10 @@ case class ShuffledHashJoinExec(
       buildNullRow: GenericInternalRow,
       isFullOuterJoin: Boolean): Iterator[InternalRow] = {
     val matchedRows = new OpenHashSet[Long]
-    TaskContext.get().addTaskCompletionListener[Unit](_ => {
-      // At the end of the task, update the task's memory usage for this
-      // [[OpenHashSet]] to track matched rows, which has two parts:
-      // [[OpenHashSet._bitset]] and [[OpenHashSet._data]].
-      val bitSetEstimatedSize = matchedRows.getBitSet.capacity / 8
-      val dataEstimatedSize = matchedRows.capacity * 8
-      longMetric("buildDataSize") += bitSetEstimatedSize + dataEstimatedSize
-    })
+    // At the end of the task, update the task's memory usage for this OpenHashSet that tracks
+    // matched rows (its underlying bit-set plus data array).
+    JoinHelper.recordOpenHashSetMemoryUsageOnTaskCompletion(
+      matchedRows, longMetric("buildDataSize"))
 
     def markRowMatched(keyIndex: Int, valueIndex: Int): Unit = {
       val rowIndex: Long = (keyIndex.toLong << 32) | valueIndex
@@ -658,4 +654,28 @@ case class ShuffledHashJoinExec(
   override protected def withNewChildrenInternal(
       newLeft: SparkPlan, newRight: SparkPlan): ShuffledHashJoinExec =
     copy(left = newLeft, right = newRight)
+}
+
+object ShuffledHashJoinExec {
+  def apply(
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      joinType: JoinType,
+      buildSide: BuildSide,
+      condition: Option[Expression],
+      left: SparkPlan,
+      right: SparkPlan,
+      isSkewJoin: Boolean = false): ShuffledHashJoinExec = {
+    val (normalizedLeftKeys, normalizedRightKeys) = HashJoin.normalizeJoinKeys(leftKeys, rightKeys)
+
+    new ShuffledHashJoinExec(
+      normalizedLeftKeys,
+      normalizedRightKeys,
+      joinType,
+      buildSide,
+      condition,
+      left,
+      right,
+      isSkewJoin)
+  }
 }

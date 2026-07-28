@@ -1022,6 +1022,54 @@ struct<x:int,y:string>
 
 
 -- !query
+table st
+|> drop col.i1
+-- !query schema
+struct<x:int,col:struct<i2:int>>
+-- !query output
+1	{"i2":3}
+
+
+-- !query
+table st
+|> drop col.i1, col.i2
+-- !query schema
+struct<x:int,col:struct<>>
+-- !query output
+1	{}
+
+
+-- !query
+table t
+|> as u
+|> drop u.x
+-- !query schema
+struct<y:string>
+-- !query output
+abc
+def
+
+
+-- !query
+select 1 as x, named_struct('x', 2, 'y', 3) as col
+|> as col
+|> drop col.x
+-- !query schema
+struct<col:struct<x:int,y:int>>
+-- !query output
+{"x":2,"y":3}
+
+
+-- !query
+select 1 as x, named_struct('middle', named_struct('inner', 2)) as outer
+|> drop outer.middle.inner
+-- !query schema
+struct<x:int,outer:struct<middle:struct<>>>
+-- !query output
+1	{"middle":{}}
+
+
+-- !query
 table t
 |> drop z
 -- !query schema
@@ -1047,18 +1095,25 @@ org.apache.spark.sql.AnalysisException
 
 -- !query
 table st
-|> drop col.i1
+|> drop col.nonexistent
 -- !query schema
 struct<>
 -- !query output
-org.apache.spark.sql.catalyst.parser.ParseException
+org.apache.spark.sql.AnalysisException
 {
-  "errorClass" : "PARSE_SYNTAX_ERROR",
-  "sqlState" : "42601",
+  "errorClass" : "FIELD_NOT_FOUND",
+  "sqlState" : "42704",
   "messageParameters" : {
-    "error" : "'.'",
-    "hint" : ""
-  }
+    "fieldName" : "`nonexistent`",
+    "fields" : "`i1`, `i2`"
+  },
+  "queryContext" : [ {
+    "objectType" : "",
+    "objectName" : "",
+    "startIndex" : 1,
+    "stopIndex" : 32,
+    "fragment" : "table st\n|> drop col.nonexistent"
+  } ]
 }
 
 
@@ -1224,8 +1279,8 @@ org.apache.spark.sql.catalyst.parser.ParseException
   "errorClass" : "PARSE_SYNTAX_ERROR",
   "sqlState" : "42601",
   "messageParameters" : {
-    "error" : "'@'",
-    "hint" : ""
+    "error" : "'@v'",
+    "hint" : ": extra input '@v'"
   }
 }
 
@@ -1395,7 +1450,8 @@ struct<>
 -- !query output
 org.apache.spark.sql.AnalysisException
 {
-  "errorClass" : "_LEGACY_ERROR_TEMP_1034",
+  "errorClass" : "WINDOW_FUNCTION_NOT_ALLOWED_IN_CLAUSE",
+  "sqlState" : "42601",
   "messageParameters" : {
     "clauseName" : "WHERE"
   }
@@ -1430,7 +1486,8 @@ struct<>
 -- !query output
 org.apache.spark.sql.AnalysisException
 {
-  "errorClass" : "_LEGACY_ERROR_TEMP_1034",
+  "errorClass" : "WINDOW_FUNCTION_NOT_ALLOWED_IN_CLAUSE",
+  "sqlState" : "42601",
   "messageParameters" : {
     "clauseName" : "WHERE"
   }
@@ -1894,9 +1951,10 @@ struct<>
 -- !query output
 org.apache.spark.sql.catalyst.parser.ParseException
 {
-  "errorClass" : "_LEGACY_ERROR_TEMP_0064",
+  "errorClass" : "INVALID_TABLESAMPLE_FRACTION",
+  "sqlState" : "22023",
   "messageParameters" : {
-    "msg" : "Sampling fraction (-1.0) must be on interval [0, 1]"
+    "fraction" : "-1.0"
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -1965,9 +2023,10 @@ struct<>
 -- !query output
 org.apache.spark.sql.catalyst.parser.ParseException
 {
-  "errorClass" : "_LEGACY_ERROR_TEMP_0064",
+  "errorClass" : "INVALID_TABLESAMPLE_FRACTION",
+  "sqlState" : "22023",
   "messageParameters" : {
-    "msg" : "Sampling fraction (2.0) must be on interval [0, 1]"
+    "fraction" : "2.0"
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -3051,6 +3110,54 @@ org.apache.spark.sql.catalyst.parser.ParseException
 
 
 -- !query
+select 3 as x, 4 as y
+|> aggregate sum(y) group by 5
+-- !query schema
+struct<>
+-- !query output
+org.apache.spark.sql.AnalysisException
+{
+  "errorClass" : "GROUP_BY_POS_OUT_OF_RANGE",
+  "sqlState" : "42805",
+  "messageParameters" : {
+    "index" : "5",
+    "size" : "2"
+  },
+  "queryContext" : [ {
+    "objectType" : "",
+    "objectName" : "",
+    "startIndex" : 52,
+    "stopIndex" : 52,
+    "fragment" : "5"
+  } ]
+}
+
+
+-- !query
+select 3 as x, 4 as y
+|> aggregate sum(y) group by 0
+-- !query schema
+struct<>
+-- !query output
+org.apache.spark.sql.AnalysisException
+{
+  "errorClass" : "GROUP_BY_POS_OUT_OF_RANGE",
+  "sqlState" : "42805",
+  "messageParameters" : {
+    "index" : "0",
+    "size" : "2"
+  },
+  "queryContext" : [ {
+    "objectType" : "",
+    "objectName" : "",
+    "startIndex" : 52,
+    "stopIndex" : 52,
+    "fragment" : "0"
+  } ]
+}
+
+
+-- !query
 table courseSales
 |> aggregate sum(earnings) group by rollup(course, `year`)
 |> where course = 'dotNET' and `year` = '2013'
@@ -3423,7 +3530,7 @@ table windowTestData
 -- !query schema
 struct<>
 -- !query output
-org.apache.spark.sql.AnalysisException
+org.apache.spark.sql.catalyst.parser.ParseException
 {
   "errorClass" : "MISSING_WINDOW_SPECIFICATION",
   "sqlState" : "42P20",
@@ -3507,7 +3614,7 @@ table windowTestData
 -- !query schema
 struct<>
 -- !query output
-org.apache.spark.sql.AnalysisException
+org.apache.spark.sql.catalyst.parser.ParseException
 {
   "errorClass" : "MISSING_WINDOW_SPECIFICATION",
   "sqlState" : "42P20",

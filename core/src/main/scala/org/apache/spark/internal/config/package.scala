@@ -28,6 +28,7 @@ import org.apache.spark.metrics.GarbageCollectionMetrics
 import org.apache.spark.network.shuffle.Constants
 import org.apache.spark.network.shuffledb.DBBackend
 import org.apache.spark.network.util.ByteUnit
+import org.apache.spark.resource.CpuAmount
 import org.apache.spark.scheduler.{EventLoggingListener, SchedulingMode}
 import org.apache.spark.shuffle.sort.io.LocalDiskShuffleDataIO
 import org.apache.spark.storage.{DefaultTopologyMapper, RandomBlockReplicationPolicy}
@@ -586,6 +587,19 @@ package object config {
       .checkValue(_ > 0, "The maximum number of threads should be positive")
       .createWithDefault(8)
 
+  private[spark] val STORAGE_DECOMMISSION_SHUFFLE_BUFFER_RACING_MIGRATIONS =
+    ConfigBuilder("spark.storage.decommission.shuffleBlocks.bufferRacingMigrations")
+      .internal()
+      .doc("Whether to buffer a shuffle-migration relocation report that arrives before the " +
+        "map output it relocates has been registered on the driver, and replay it once " +
+        "registration happens. When false, such a relocation is dropped (legacy behavior), " +
+        "which can leave the map output pointing at the decommissioned origin executor and " +
+        "surface downstream as a fetch failure once that executor is removed.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
+
   private[spark] val STORAGE_DECOMMISSION_RDD_BLOCKS_ENABLED =
     ConfigBuilder("spark.storage.decommission.rddBlocks.enabled")
       .doc("Whether to transfer RDD blocks during block manager decommissioning.")
@@ -645,6 +659,16 @@ package object config {
       .version("3.2.0")
       .bytesConf(ByteUnit.BYTE)
       .createOptional
+
+  private[spark] val STORAGE_SHUFFLE_MANAGER_INIT_WAITING_TIMEOUT =
+    ConfigBuilder("spark.storage.shuffleManager.initWaitingTimeout")
+      .doc("Maximum time to wait for the ShuffleManager to be initialized when receiving " +
+        "shuffle migration requests. If the ShuffleManager is not initialized within this " +
+        "timeout, the migration request will be rejected and the sender should retry.")
+      .version("4.2.0")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ > 0, "Timeout should be positive.")
+      .createWithDefaultString("30s")
 
   private[spark] val STORAGE_REPLICATION_TOPOLOGY_FILE =
     ConfigBuilder("spark.storage.replication.topologyFile")
@@ -711,7 +735,21 @@ package object config {
       .createWithDefault(false)
 
   private[spark] val CPUS_PER_TASK =
-    ConfigBuilder("spark.task.cpus").version("0.5.0").intConf.createWithDefault(1)
+    ConfigBuilder("spark.task.cpus")
+      .version("0.5.0")
+      .decimalConf
+      // Validate before normalizing: bounding first keeps the setScale in the normalize step
+      // from materializing enormous unscaled values for extreme exponents (e.g. 1e100000000),
+      // and rejecting excess precision is clearer than silently rounding it away.
+      .checkValue(v => v >= CpuAmount.MIN_AMOUNT && v <= CpuAmount.MAX_AMOUNT,
+        "Number of cores to allocate for each task must be a positive value between " +
+          s"${CpuAmount.MIN_AMOUNT} and ${CpuAmount.MAX_AMOUNT} (inclusive).")
+      .checkValue(CpuAmount.stripTrailingZeros(_).scale <= CpuAmount.SCALE,
+        s"Number of cores to allocate for each task supports at most ${CpuAmount.SCALE} " +
+          "decimal places.")
+      // normalize to the fixed CPU accounting scale so every read is a uniform, compact BigDecimal
+      .transform(CpuAmount.normalize)
+      .createWithDefault(BigDecimal(1))
 
   private[spark] val DYN_ALLOCATION_ENABLED =
     ConfigBuilder("spark.dynamicAllocation.enabled")
@@ -1747,6 +1785,21 @@ package object config {
       .stringConf
       .createWithDefault("sort")
 
+  private[spark] val SHUFFLE_MANAGER_INCREMENTAL =
+    ConfigBuilder("spark.shuffle.manager.incremental")
+      .doc("The ShuffleManager implementation used for pipelined (incrementally-readable) " +
+        "shuffle dependencies, whose consumer stage may begin reading output while the producer " +
+        "stage is still running. Regular shuffle dependencies continue to use " +
+        "spark.shuffle.manager. The two managers coexist in the same JVM and each shuffle is " +
+        "routed by its dependency type, so a cluster can run both regular and pipelined (e.g. " +
+        "real-time mode) queries. Defaults to the built-in streaming shuffle manager; accepts " +
+        "the short alias \"streaming\" (the default) or a fully-qualified " +
+        "PipelinedShuffleManager class name.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .stringConf
+      .createWithDefault("streaming")
+
   private[spark] val SHUFFLE_REDUCE_LOCALITY_ENABLE =
     ConfigBuilder("spark.shuffle.reduceLocality.enabled")
       .doc("Whether to compute locality preferences for reduce tasks")
@@ -1766,6 +1819,68 @@ package object config {
       .version("2.0.0")
       .intConf
       .createWithDefault(8)
+
+  // ---------------------------------------------------------------------------
+  // Streaming shuffle writer configs
+  // ---------------------------------------------------------------------------
+
+  private[spark] val STREAMING_SHUFFLE_CHECKSUM_ENABLED =
+    ConfigBuilder("spark.shuffle.streaming.checksum.enabled")
+      .doc("Whether to append a CRC32C checksum to each streaming shuffle data buffer. " +
+        "When enabled, the writer computes the checksum and embeds it in the DataMessage header; " +
+        "the reader recomputes and compares. A mismatch fails the task, providing early " +
+        "detection of data corruption in transit.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
+
+  private[spark] val STREAMING_SHUFFLE_READER_MAX_MEMORY =
+    ConfigBuilder("spark.shuffle.streaming.readerMaxMemory")
+      .doc("Best-effort memory limit in bytes for data buffered in a streaming shuffle reader " +
+        "task. The per-writer byte quota is derived from this value divided by the number of " +
+        "shuffle writers. When the quota is exhausted the reader applies TCP back-pressure.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .createWithDefault(32 << 20) // 32 MB
+
+  private[spark] val STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE =
+    ConfigBuilder("spark.shuffle.streaming.networkBufferSize")
+      .doc("Target byte size for each network buffer sent from a streaming shuffle writer to a " +
+        "reader. Larger values reduce per-message overhead; smaller values reduce latency.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ > 0, "spark.shuffle.streaming.networkBufferSize must be positive.")
+      .createWithDefault(32768) // 32 KB
+
+  private[spark] val STREAMING_SHUFFLE_NETWORK_BUFFER_MAX_WAIT_TIME_MS =
+    ConfigBuilder("spark.shuffle.streaming.networkBufferMaxWaitTimeMs")
+      .doc("Maximum time in milliseconds a partially-filled network buffer is held before " +
+        "being flushed to the reader. Lower values reduce latency at the cost of smaller, " +
+        "less efficient messages.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .longConf
+      .createWithDefault(50)
+
+  private[spark] val STREAMING_SHUFFLE_WRITER_MAX_MEMORY =
+    ConfigBuilder("spark.shuffle.streaming.writerMaxMemory")
+      .doc("Best-effort memory limit in bytes for in-flight data buffers in a streaming " +
+        "shuffle writer task. Includes TCP send/receive buffers. The writer back-pressures " +
+        "the upstream iterator when this limit is reached. This is a best-effort bound: " +
+        "back-pressure is accounted per network buffer, so an individual serialized row that " +
+        "exceeds the network buffer size can push actual in-flight memory above this limit.")
+      .version("4.3.0")
+      .internal()
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ > 0, "spark.shuffle.streaming.writerMaxMemory must be positive.")
+      .createWithDefault(32 << 20) // 32 MB
 
   private[spark] val SHUFFLE_DETECT_CORRUPT =
     ConfigBuilder("spark.shuffle.detectCorrupt")
@@ -1902,6 +2017,21 @@ package object config {
       .checkValue(v => v > 0, "The max failures should be a positive value.")
       .createWithDefault(40)
 
+  private[spark] val PIPELINED_GROUP_SLOT_CHECK_ENABLED =
+    ConfigBuilder("spark.scheduler.pipelinedGroup.slotCheck.enabled")
+      .internal()
+      .doc("When true, before co-scheduling a pipelined-shuffle stage group the DAGScheduler " +
+        "checks that the group's total task demand fits in the currently free slots of its " +
+        "resource profile (total capacity minus the outstanding -- running plus enqueued -- " +
+        "tasks of other work), and fails the job with CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT " +
+        "rather than co-scheduling a group that cannot fit and deadlocking. Set to false for " +
+        "deployments that admit capacity out-of-band (e.g. a slot reservation), which then own " +
+        "admission. Only applies to jobs that use a pipelined shuffle dependency.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
+
   private[spark] val NUM_CANCELLED_JOB_GROUPS_TO_TRACK =
     ConfigBuilder("spark.scheduler.numCancelledJobGroupsToTrack")
       .doc("The maximum number of tracked job groups that are cancelled with " +
@@ -1935,6 +2065,21 @@ package object config {
       .checkValue(v => 1024 * 1024 <= v && v <= MAX_BUFFER_SIZE_BYTES,
         s"The value must be in allowed range [1,048,576, ${MAX_BUFFER_SIZE_BYTES}].")
       .createWithDefault(1024 * 1024)
+
+  private[spark] val UNSAFE_SORTER_SPILL_MERGE_FACTOR =
+    ConfigBuilder("spark.unsafe.sorter.spill.merge.factor")
+      .doc("Maximum number of spill files to merge simultaneously in UnsafeExternalSorter. " +
+        "When the number of spill files exceeds this value, a multi-round merge is performed " +
+        "to limit the number of concurrently open file readers and avoid OOM during sort-merge. " +
+        "A smaller value uses less memory but incurs more intermediate disk I/O. " +
+        "Set to -1 to disable bounded merging (legacy behavior).")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .internal()
+      .version("4.2.0")
+      .intConf
+      .checkValue(v => v == -1 || v >= 2,
+        "The merge factor must be -1 (disabled) or at least 2.")
+      .createWithDefault(-1)
 
   private[spark] val DEFAULT_PLUGINS_LIST = "spark.plugins.defaultList"
 
@@ -2047,7 +2192,31 @@ package object config {
       .doc("If true, Spark master tries to use Java 21 virtual thread for REST API.")
       .version("4.0.0")
       .booleanConf
-      .createWithDefault(false)
+      .createWithDefault(true)
+
+  private[spark] val MASTER_REST_SERVER_ALLOWED_APP_RESOURCE_PATTERNS =
+    ConfigBuilder("spark.master.rest.allowedAppResourcePatterns")
+      .doc("Comma-separated list of regular expressions matched against the application " +
+        "resource (application jar path) in the Spark Master REST API. When non-empty, a " +
+        "driver submission is rejected unless its application resource fully matches at " +
+        "least one of the patterns. When empty (the default), all application resources " +
+        "are allowed. Example: \"file:.*,hdfs://.*\".")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .stringConf
+      .toSequence
+      .createWithDefault(Nil)
+
+  private[spark] val MASTER_REST_SERVER_MAX_REQUEST_BODY_SIZE =
+    ConfigBuilder("spark.master.rest.maxRequestBodySize")
+      .doc("The maximum size of the request body accepted by the Spark Master REST API. " +
+        "Requests whose body exceeds this size are rejected with HTTP 413 " +
+        "(Request Entity Too Large).")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ > 0, "The max request body size must be positive.")
+      .createWithDefaultString("100m")
 
   private[spark] val MASTER_UI_PORT = ConfigBuilder("spark.master.ui.port")
     .version("1.1.0")
@@ -2256,7 +2425,7 @@ package object config {
       "Compression will use spark.io.compression.codec")
     .version("0.6.0")
     .booleanConf
-    .createWithDefault(false)
+    .createWithDefault(true)
 
   private[spark] val RDD_PARALLEL_LISTING_THRESHOLD =
     ConfigBuilder("spark.rdd.parallelListingThreshold")
@@ -2359,6 +2528,24 @@ package object config {
       .enumConf(SchedulingMode)
       .createWithDefault(SchedulingMode.FIFO)
 
+  private[spark] val STREAMING_ID_AWARE_SCHEDULER_LOGGING_ENABLED =
+    ConfigBuilder("spark.scheduler.streaming.idAwareLogging.enabled")
+      .doc("When true, scheduler log messages for streaming tasks include " +
+        "the structured streaming query ID and batch ID.")
+      .version("4.2.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
+
+  private[spark] val STREAMING_ID_AWARE_SCHEDULER_LOGGING_QUERY_ID_LENGTH =
+    ConfigBuilder("spark.scheduler.streaming.idAwareLogging.queryIdLength")
+      .doc("Maximum number of characters of the streaming query ID to include " +
+        "in scheduler log messages. Set to -1 to include the full query ID.")
+      .version("4.2.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .createWithDefault(5)
+
   private[spark] val SCHEDULER_REVIVE_INTERVAL =
     ConfigBuilder("spark.scheduler.revive.interval")
       .version("0.8.1")
@@ -2405,16 +2592,18 @@ package object config {
         "longer time than the threshold. This config helps speculate stage with very few " +
         "tasks. Regular speculation configs may also apply if the executor slots are " +
         "large enough. E.g. tasks might be re-launched if there are enough successful runs " +
-        "even though the threshold hasn't been reached. The number of slots is computed based " +
-        "on the conf values of spark.executor.cores and spark.task.cpus minimum 1.")
+        "even though the threshold hasn't been reached. The number of slots is the maximum " +
+        "number of concurrent tasks per executor for the stage's resource profile, computed " +
+        "from the executor cores and the task cpus amount (which may be fractional), or 1 " +
+        "when the executor cores are not known.")
       .version("3.0.0")
       .timeConf(TimeUnit.MILLISECONDS)
       .createOptional
 
   private[spark] val SPECULATION_EFFICIENCY_TASK_PROCESS_RATE_MULTIPLIER =
     ConfigBuilder("spark.speculation.efficiency.processRateMultiplier")
-      .doc("A multiplier that used when evaluating inefficient tasks. The higher the multiplier " +
-        "is, the more tasks will be possibly considered as inefficient.")
+      .doc("A multiplier that is used when evaluating inefficient tasks. The higher the " +
+        "multiplier is, the more tasks will be possibly considered as inefficient.")
       .version("3.4.0")
       .doubleConf
       .checkValue(v => v > 0.0 && v <= 1.0, "multiplier must be in (0.0, 1.0]")
@@ -2819,6 +3008,75 @@ package object config {
       .booleanConf
       .createWithDefault(false)
 
+  private[spark] val STORAGE_RDD_BLOCK_CHECKSUM_ENABLED =
+    ConfigBuilder("spark.storage.rddBlockChecksum.enabled")
+      .internal()
+      .doc("When true, the BlockManager computes a content checksum over the serialized bytes " +
+        "of every serialized RDD cache block at store time and reports it to the driver. Only " +
+        "serialized blocks are covered; deserialized in-memory blocks are not checksummed.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val STORAGE_RDD_BLOCK_CHECKSUM_ALGORITHM =
+    ConfigBuilder("spark.storage.rddBlockChecksum.algorithm")
+      .internal()
+      .doc("The checksum algorithm used for RDD block content checksums (e.g. local-checkpoint " +
+        "verification). Only built-in JDK algorithms are supported.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .stringConf
+      .transform(_.toUpperCase(Locale.ROOT))
+      .checkValues(Set("ADLER32", "CRC32", "CRC32C"))
+      .createWithDefault("CRC32C")
+
+  private[spark] val STORAGE_RDD_BLOCK_CHECKSUM_VERIFY_ON_REPLICATION =
+    ConfigBuilder("spark.storage.rddBlockChecksum.verifyOnReplication")
+      .internal()
+      .doc("When true, a replica of a checksummed RDD block recomputes the content checksum over " +
+        "the received bytes to verify the transfer, instead of trusting the checksum sent by the " +
+        "source. Off by default: the source's checksum is recorded directly, since the transport " +
+        "layer already provides integrity.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val LOCAL_CHECKPOINT_VERIFY_CHECKSUM_ENABLED =
+    ConfigBuilder("spark.checkpoint.local.verifyChecksum.enabled")
+      .internal()
+      .doc("When true, Spark fingerprints the serialized bytes of locally-checkpointed RDD " +
+        "partitions at store time and, at the checkpoint commit point, detects partitions that " +
+        "were materialized inconsistently by more than one task attempt (Spark non-determinism " +
+        "combined with retries/speculation) and seals each partition to a single version. Guards " +
+        "against silently inconsistent local checkpoints. This implies checksum computation for " +
+        "the checkpointed RDD regardless of spark.storage.rddBlockChecksum.enabled. Only applied " +
+        "to a localCheckpoint with a SERIALIZED storage level (e.g. DISK_ONLY); a deserialized " +
+        "level (the default MEMORY_AND_DISK) has no checksummable bytes and is left unverified - " +
+        "see spark.checkpoint.local.verifyChecksum.forceSerialized to opt a default checkpoint " +
+        "into a serialized level. Sealing runs at checkpoint finalization: an eager checkpoint " +
+        "is sealed before any consumer reads it, while a lazy one is sealed after its first job " +
+        "materializes it (so reads within that job, before finalization, may still see an " +
+        "unsealed copy).")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
+
+  private[spark] val LOCAL_CHECKPOINT_VERIFY_CHECKSUM_FORCE_SERIALIZED =
+    ConfigBuilder("spark.checkpoint.local.verifyChecksum.forceSerialized")
+      .internal()
+      .doc("When true (and verifyChecksum.enabled is true), localCheckpoint adapts a " +
+        "deserialized storage level to its serialized equivalent so the checkpoint's blocks " +
+        "can be checksummed and sealed. Off by default so localCheckpoint's storage level is " +
+        "not silently changed; enable it to verify checkpoints that would otherwise use the " +
+        "deserialized default.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
   private[spark] val STAGE_MAX_ATTEMPTS =
     ConfigBuilder("spark.stage.maxAttempts")
       .doc("Specify the max attempts for a stage - the spark job will be aborted if any of its " +
@@ -2919,4 +3177,22 @@ package object config {
       .checkValue(v => v.forall(Set("stdout", "stderr").contains),
         "The value only can be one or more of 'stdout, stderr'.")
       .createWithDefault(Seq("stdout", "stderr"))
+
+  private[spark] val DRIVER_LIMIT_ACTIVE_PROCESSOR_COUNT_ENABLED =
+    ConfigBuilder("spark.driver.limitActiveProcessorCount.enabled")
+      .doc("Whether to add -XX:ActiveProcessorCount=<spark.driver.cores> to the driver JVM " +
+        "options. Currently, this only takes effect in YARN cluster mode.")
+      .version("4.2.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val EXECUTOR_LIMIT_ACTIVE_PROCESSOR_COUNT_ENABLED =
+    ConfigBuilder("spark.executor.limitActiveProcessorCount.enabled")
+      .doc("Whether to add -XX:ActiveProcessorCount=<spark.executor.cores> to executor JVM " +
+        "options. Currently, this only takes effect in YARN mode.")
+      .version("4.2.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
 }

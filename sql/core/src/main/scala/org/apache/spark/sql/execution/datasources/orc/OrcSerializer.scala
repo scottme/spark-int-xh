@@ -28,6 +28,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.SpecializedGetters
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.TimestampNanosVal
 
 /**
  * A serializer to serialize Spark rows to ORC structs.
@@ -154,6 +155,19 @@ class OrcSerializer(dataSchema: StructType) {
       val result = new OrcTimestamp(ts.getTime)
       result.setNanos(ts.getNanos)
       result
+    case t: TimestampLTZNanosType => (getter, ordinal) =>
+      val v = getter.get(ordinal, t).asInstanceOf[TimestampNanosVal]
+      val instant = DateTimeUtils.timestampNanosToInstant(v)
+      val result = new OrcTimestamp(instant.toEpochMilli)
+      result.setNanos(instant.getNano)
+      result
+    case t: TimestampNTZNanosType => (getter, ordinal) =>
+      val v = getter.get(ordinal, t).asInstanceOf[TimestampNanosVal]
+      val localDateTime = DateTimeUtils.timestampNanosToLocalDateTime(v)
+      val ts = java.sql.Timestamp.valueOf(localDateTime)
+      val result = new OrcTimestamp(ts.getTime)
+      result.setNanos(ts.getNanos)
+      result
 
     case DecimalType.Fixed(precision, scale) =>
       OrcShimUtils.getHiveDecimalWritable(precision, scale)
@@ -178,19 +192,22 @@ class OrcSerializer(dataSchema: StructType) {
       result
 
     case ArrayType(elementType, _) => (getter, ordinal) =>
-      val result = OrcStruct.createValue(orcType)
-        .asInstanceOf[OrcList[WritableComparable[_]]]
-      // Need to put all converted values to a list, can't reuse object.
-      val elementConverter = newConverter(elementType, orcType.getChildren.get(0), reuseObj = false)
       val array = getter.getArray(ordinal)
-      var i = 0
-      while (i < array.numElements()) {
-        if (array.isNullAt(i)) {
-          result.add(null)
-        } else {
-          result.add(elementConverter(array, i))
+      val numElements = array.numElements()
+      val result = new OrcList[WritableComparable[_]](orcType, numElements)
+      if (numElements > 0) {
+        // Need to put all converted values to a list, can't reuse object.
+        val elementConverter =
+          newConverter(elementType, orcType.getChildren.get(0), reuseObj = false)
+        var i = 0
+        while (i < numElements) {
+          if (array.isNullAt(i)) {
+            result.add(null)
+          } else {
+            result.add(elementConverter(array, i))
+          }
+          i += 1
         }
-        i += 1
       }
       result
 
